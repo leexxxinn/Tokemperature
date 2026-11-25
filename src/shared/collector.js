@@ -1,0 +1,3418 @@
+'use strict';
+
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
+const { customPricingPath } = require('./tokscaleConfig');
+const { catalogRevision, createPricingCatalogRefresher } = require('./pricingCatalog');
+const { senpiWatchSources } = require('./providers/senpi/paths');
+const { abortReason, throwIfAborted } = require('./abortSignal');
+const { readJson, sharedDataDir } = require('./config');
+const { appVersion } = require('./appVersion');
+const { normalizeClientsCsv } = require('./clientTracking');
+const { FORK_ONLY_CLIENT_IDS } = require('./clientCatalog');
+const { canonicalWatchPath, cherryStudioTranscriptRoots, clientSourceRoots, copilotExporterWatch } = require('./clientSources');
+const { clientDiagnosticRoots, clientSourceChecks, visibleDiagnosticRoots } = require('./clientSourceObservations');
+const {
+  CLIENT_HEALTH_VERSION,
+  MAX_DIAGNOSTICS_PER_CLIENT,
+  deriveClientOverall
+} = require('./clientHealth');
+const { tokscalePackageNameForPlatform } = require('./tokscalePlatform');
+const { createTokscaleCapabilityResolver, filterSupportedClients, parseSupportedClients } = require('./tokscaleCapabilities');
+const { normalizeCustomScanPaths, customScanPathsFingerprint, tokscaleExtraDirsEnv } = require('./customScanPaths');
+const { TOKSCALE_CLIENT_ALIASES, tokscaleScanClientIds } = require('./tokscaleClientMapping');
+const {
+  applyPeriodDelta,
+  emptyPeriod,
+  extractUsageBundleFromTokscale,
+  mergeNormalizedPeriods,
+  mergePeriods,
+  normalizeClientName,
+  normalizePeriod,
+  UNATTRIBUTED_USAGE_CLIENT
+} = require('./usage');
+const { collectWslUsage: collectWslUsageImpl, emptyWslBundle, probeWslState: probeWslStateImpl } = require('./wslUsage');
+const { createWatcherHost } = require('./watcherHost');
+const {
+  openWatch,
+  watcherOptions,
+  watchIgnoreMatcher,
+  clientWatchCandidates,
+  selfSyncSourceRootsForClients,
+  antigravitySummaryWatchSources,
+  watchClientRootsForClients,
+  watchPathsForClients,
+  watchAttributionRootsForClients,
+  clientsForWatchPath,
+  isCodexHome,
+  isSelfWatchSqliteSidecarEvent,
+  SELF_SYNCED_CLIENTS,
+  resolveWatchUsePolling,
+  watchPollingForbidden,
+  WATCH_DESCRIPTOR_ERROR_CODES,
+  WATCH_POLLING_ENTRY_LIMIT,
+  WATCH_POLLING_LIMIT_CODE,
+  WATCH_POLLING_UNAVAILABLE_CODE,
+  WATCH_REFUSAL_CODES
+} = require('./watchPolicy');
+const { createSessionActivityScheduler } = require('./sessionActivityScheduler');
+const { activityWatchSources, activityClientsForPath } = require('./sessionActivityWatch');
+const { localDayKey, parseGraphResult, normalizeHistory, mergeHistories, mergeDailyMaps } = require('./history');
+const {
+  graphFromDailyHistoryArchive, readDailyHistoryArchive, retainDailyHistory, retainLiveDailyHistory
+} = require('./dailyHistoryArchive');
+const {
+  createSubprocessTermination,
+  terminationUnconfirmedError
+} = require('./subprocessTermination');
+const { lowerSubprocessPriority } = require('./subprocessPriority');
+const { createAntigravitySelfSync } = require('./providers/antigravity/selfSync');
+const { withCursorLifecycle } = require('./providers/cursor/lifecycle');
+const { createCursorSelfSync } = require('./providers/cursor/selfSync');
+const { createCursorUsageSource, snapshotUsageKey } = require('./providers/cursor/usageSource');
+const { isCursorDesktopStateWrite } = require('./providers/cursor/desktopState');
+const {
+  applySessionMetadata,
+  applyT3SessionParents,
+  applySessionIdentities,
+  applyTokscaleSessionMetadata,
+  projectIdentity,
+  projectPathFromJsonl,
+  sessionMetadataMap
+} = require('./sessionMetadata');
+const { kimiWorkSessionsRoots } = require('./providers/kimi/sessionMetadata');
+const { sessionActivityProvidersFor, refreshSessionActivity } = require('./sessionActivityRegistry');
+const { isSessionActivityClient } = require('./sessionActivityProviders');
+const { normalizeReasoningEffort, isSessionReasoningEffortClient } = require('./sessionLive');
+const { readT3Activities } = require('./t3SessionActivity');
+const { createProcessStartBatch } = require('./processStarts');
+const { catpawSourcesFingerprint } = require('./providers/catpaw/paths');
+const { readLocalUsageView, resolveLocalUsagePricing } = require('./providers/codex/localUsage');
+const { createLocalUsageSource } = require('./providers/codex/localUsageSource');
+const {
+  createReasonixNativeSessionCache,
+  isReasonixNativeSessionPath,
+  isReasonixNativeSessionSidecar,
+  reasonixNativeSessionWatchRoots,
+  emptyNativeView
+} = require('./providers/reasonix/sessions');
+const { hostOsInfo, normalizeOsInfo } = require('./osVersion');
+const { hostDeviceKind } = require('./deviceHardware');
+const {
+  clampTimerDelayMs,
+  createSelfSyncThrottle,
+  createSourceSyncQueue,
+  mergeSelfSyncSelection,
+  selfSyncSelected,
+  SELF_SYNC_KINDS
+} = require('./selfSyncThrottle');
+const {
+  LIMITS_RESET_BOUNDARY_MAX_TIMER_MS,
+  nextLimitsResetBoundary,
+  pruneAttemptedResetBoundaries
+} = require('./limits/resetBoundary');
+
+function toUnpackedPath(p) {
+  // electron-builder asarUnpack stores real files at .../app.asar.unpacked/...
+  // require.resolve() returns the .../app.asar/... path, which spawn() can't read.
+  const asarSeg = `${path.sep}app.asar${path.sep}`;
+  return p && p.includes(asarSeg) ? p.replace(asarSeg, `${path.sep}app.asar.unpacked${path.sep}`) : p;
+}
+
+const TOKSCALE_BIN_JS = toUnpackedPath(require.resolve('tokscale/bin.js'));
+
+function bundledPackageCandidates() {
+  const primary = tokscalePackageNameForPlatform();
+  if (primary) return [primary];
+  if (process.platform === 'linux') {
+    if (process.arch === 'arm64') return ['@tokscale/cli-linux-arm64-gnu', '@tokscale/cli-linux-arm64-musl'];
+    if (process.arch === 'x64') return ['@tokscale/cli-linux-x64-gnu', '@tokscale/cli-linux-x64-musl'];
+  }
+  return [];
+}
+
+function locateBundledBinary() {
+  const binaryName = process.platform === 'win32' ? 'tokscale.exe' : 'tokscale';
+  for (const pkg of bundledPackageCandidates()) {
+    try {
+      const pkgPath = require.resolve(`${pkg}/package.json`);
+      const binPath = toUnpackedPath(path.join(path.dirname(pkgPath), 'bin', binaryName));
+      const pkgJson = readJson(pkgPath, {});
+      if (fs.existsSync(binPath)) {
+        return { source: 'bundled', path: binPath, version: String(pkgJson.version || '0.0.0'), packageName: pkg };
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+// The bundled binary is the only native candidate: packaging swaps the pinned
+// fork build into @tokscale/cli-<platform>, and an upstream npm build would
+// silently drop the downstream session/workspace report grouping. A
+// `current.json` pointer left behind by the retired npm updater is ignored.
+function resolvePlatformBinary() {
+  return locateBundledBinary() || { source: 'shim', path: TOKSCALE_BIN_JS, version: null };
+}
+
+// Declared app build metadata, not verification of the executable's bytes.
+function readTokscaleBundledBuild(manifest = readJson(path.join(__dirname, '../../scripts/vendor/tokscale.json'), null)) {
+  if (!manifest || ![undefined, null, 'override'].includes(manifest.mode)) return null;
+  if (typeof manifest.commit !== 'string' || !/^[0-9a-f]{40}$/i.test(manifest.commit)) return null;
+  if (typeof manifest.releaseTag !== 'string' || !manifest.releaseTag) return null;
+  return { releaseTag: manifest.releaseTag, commit: manifest.commit };
+}
+
+function getTokscaleStatus() {
+  if (bundledPackageCandidates().length === 0) return { supported: false };
+  const current = resolvePlatformBinary();
+  return {
+    supported: true,
+    current: { source: current.source, version: current.version, path: current.path },
+    bundledBuild: readTokscaleBundledBuild()
+  };
+}
+
+// Tokscale reads a few XDG environment variables with a bare
+// `std::env::var(...)`, so ANY present value wins — including "" and "   ".
+// Token Monitor resolves those same roots with nonBlankEnvPath(), which treats a
+// blank value as unset (matching the XDG basedir spec, where $XDG_DATA_HOME is
+// "either not set or empty"). A blank value therefore makes the watcher and the
+// health check resolve ~/.local/share while the scan resolves "" or "   " as the
+// root — a directory that is not even absolute — so health can read `detected`
+// while the collector looks somewhere else entirely.
+//
+// Dropping the blank key entirely (rather than rewriting it to another value)
+// is what makes the two agree: tokscale then takes its own fallback, which is
+// the same root Token Monitor already resolved. It also stays correct if
+// tokscale later adopts blank-as-unset itself, and it fixes every client behind
+// the affected roots at once — PathRoot::XdgData (opencode, amp, kilo, crush,
+// goose, zed, micode, devin-cli, hindsight), PathRoot::Config's Linux arm
+// (antigravity, trae, warp, mcode, hindsight) and the codex headless roots.
+//
+// Only these three are listed. TOKSCALE_CONFIG_DIR is deliberately NOT here,
+// because both sides already agree on it: an empty value is unset, while any
+// non-empty value — whitespace included — is an override. Tokscale spells that
+// `!custom.is_empty()` and Token Monitor `override.length > 0`, so there is
+// nothing to reconcile.
+//
+// Blank is the whole predicate, so one case is knowingly left alone: a
+// NON-blank but relative XDG_CONFIG_HOME. Token Monitor rejects it via
+// absoluteEnvPath() (and so does the `dirs` crate behind Tokscale's own
+// fallback) while Tokscale's raw read would accept it, but that is a separate
+// divergence on an invalid-per-spec value, and the Linux-only arm it lives in
+// cannot be exercised from this repo's test matrix. Relative XDG_DATA_HOME is
+// fine as-is: nonBlankEnvPath keeps it, and Tokscale reads it the same way.
+const TOKSCALE_BLANK_SENSITIVE_ENV_KEYS = Object.freeze([
+  'XDG_DATA_HOME',
+  'XDG_CONFIG_HOME',
+  'TOKSCALE_HEADLESS_DIR'
+]);
+
+// Windows environment names are case-insensitive, and `{ ...process.env }`
+// preserves whatever casing the OS handed Node — a shell can export
+// `Xdg_Data_Home` and a canonical-spelling lookup then misses it entirely,
+// leaving the blank value in the child's environment. Match case-insensitively
+// there so the key we delete is the one that is actually present. POSIX names
+// are case-sensitive, so an exact match stays the narrower correct rule.
+function tokscaleEnvWithBlanksDropped(env, platform = process.platform) {
+  const caseInsensitive = platform === 'win32';
+  const namesFor = (key) => {
+    if (!caseInsensitive) return Object.prototype.hasOwnProperty.call(env, key) ? [key] : [];
+    const lowered = key.toLowerCase();
+    return Object.keys(env).filter((name) => name.toLowerCase() === lowered);
+  };
+  let dropped = null;
+  for (const key of TOKSCALE_BLANK_SENSITIVE_ENV_KEYS) {
+    for (const name of namesFor(key)) {
+      const value = env[name];
+      if (typeof value !== 'string' || value.trim()) continue;
+      if (!dropped) dropped = { ...env };
+      delete dropped[name];
+    }
+  }
+  return dropped || env;
+}
+
+function tokscaleCommand(options = {}) {
+  const resolved = resolvePlatformBinary();
+  const useDirect = Boolean(resolved && resolved.source !== 'shim');
+  const customExtraDirs = tokscaleExtraDirsEnv(
+    options.customScanPaths,
+    process.env.TOKSCALE_EXTRA_DIRS,
+    { platform: options.platform || process.platform, home: options.homeDir }
+  );
+  const extraDirsEnv = customExtraDirs
+    ? { ...process.env, TOKSCALE_EXTRA_DIRS: customExtraDirs }
+    : process.env;
+  const env = tokscaleEnvWithBlanksDropped(extraDirsEnv, options.platform || process.platform);
+  const command = useDirect
+    ? { bin: resolved.path, prefixArgs: [], env }
+    : { bin: process.execPath, prefixArgs: [TOKSCALE_BIN_JS], env: { ...env, ELECTRON_RUN_AS_NODE: '1' } };
+  return {
+    ...command,
+    identity: [resolved?.source || 'none', resolved?.path || '', resolved?.version || '', resolved?.integrity || ''].join('|')
+  };
+}
+
+function parseJsonOutput(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) throw new Error('tokscale produced empty stdout');
+  try { return JSON.parse(text); } catch (_) {
+    const starts = [text.indexOf('{'), text.indexOf('[')].filter((value) => value >= 0).sort((a, b) => a - b);
+    for (const start of starts) {
+      try { return JSON.parse(text.slice(start)); } catch (_inner) {}
+    }
+  }
+  throw new Error(`Could not parse tokscale JSON output: ${text.slice(0, 300)}`);
+}
+
+function spawnTokscaleJson(userArgs, commandTimeoutMs, command = tokscaleCommand(), signal, options = {}) {
+  const { bin, prefixArgs, env } = command;
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, [...prefixArgs, ...userArgs], { env, windowsHide: true });
+    lowerSubprocessPriority(child);
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timeout = null;
+    let terminalError = null;
+    const termination = createSubprocessTermination(child, {
+      ...(options.terminationOptions || {}),
+      onUnconfirmed() {
+        const error = terminationUnconfirmedError(terminalError, options.operation || 'tokscale');
+        try { options.onTerminationUnconfirmed?.(error); } catch (_) {}
+        finish(error);
+      }
+    });
+
+    function finish(error, value) {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+      if (error) reject(error);
+      else resolve(value);
+    }
+
+    function onAbort() {
+      if (terminalError) return;
+      terminalError = abortReason(signal);
+      if (timeout) clearTimeout(timeout);
+      timeout = null;
+      termination.request();
+    }
+
+    timeout = setTimeout(() => {
+      if (terminalError) return;
+      terminalError = new Error(`tokscale timed out after ${commandTimeoutMs}ms`);
+      timeout = null;
+      termination.request();
+    }, commandTimeoutMs);
+    // Keep draining both pipes after termination is requested, but stop retaining
+    // data the result can no longer use. A stubborn child must not grow our heap
+    // while the physical-close barrier waits for TERM/KILL to take effect.
+    child.stdout.on('data', (chunk) => { if (!settled && !terminalError) stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => {
+      if (settled || terminalError || stderr.length >= MAX_TOKSCALE_STDERR_LENGTH) return;
+      stderr += chunk.toString().slice(0, MAX_TOKSCALE_STDERR_LENGTH - stderr.length);
+    });
+    child.on('error', (error) => {
+      if (terminalError) return;
+      finish(error);
+    });
+    child.on('close', (code) => {
+      termination.confirmClosed();
+      if (settled) return;
+      if (terminalError) return finish(terminalError);
+      if (code !== 0) {
+        const error = new Error(`tokscale exited with code ${code}: ${stderr.trim() || stdout.trim()}`);
+        error.tokscaleExitCode = code;
+        error.tokscaleStderr = stderr;
+        return finish(error);
+      }
+      try { finish(null, parseJsonOutput(stdout)); } catch (error) { finish(error); }
+    });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+const TOKSCALE_CAPABILITY_PROBE_TIMEOUT_MS = 10_000;
+const MAX_TOKSCALE_STDERR_LENGTH = 64 * 1024;
+// tokscale rejects an unknown --client value with this exact exit code (see
+// the umbrella-client mapping comment below) — verified on 4.7.0 and 4.8.0.
+const TOKSCALE_UNKNOWN_CLIENT_EXIT_CODE = 2;
+
+function spawnTokscaleHelp(command, options = {}) {
+  const timeoutMs = options.timeoutMs ?? TOKSCALE_CAPABILITY_PROBE_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const child = spawn(command.bin, [...command.prefixArgs, '--help'], { env: command.env, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let terminalError = null;
+    const termination = createSubprocessTermination(child, {
+      ...(options.terminationOptions || {}),
+      onUnconfirmed() {
+        const error = terminationUnconfirmedError(terminalError, 'tokscale capability probe');
+        try { options.onTerminationUnconfirmed?.(error); } catch (_) {}
+        finish(error);
+      }
+    });
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timeout = setTimeout(() => {
+      if (terminalError) return;
+      terminalError = new Error(`tokscale capability probe timed out after ${timeoutMs}ms`);
+      termination.request();
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => {
+      if (!settled && !terminalError) stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      if (settled || terminalError || stderr.length >= MAX_TOKSCALE_STDERR_LENGTH) return;
+      stderr += chunk.toString().slice(0, MAX_TOKSCALE_STDERR_LENGTH - stderr.length);
+    });
+    child.on('error', (error) => {
+      if (terminalError) return;
+      finish(error);
+    });
+    child.on('close', (code) => {
+      termination.confirmClosed();
+      if (settled) return;
+      if (terminalError) return finish(terminalError);
+      if (code !== 0) return finish(new Error(`--help exited with code ${code}: ${stderr.trim() || stdout.trim()}`));
+      try { finish(null, parseSupportedClients(`${stdout}\n${stderr}`)); } catch (error) { finish(error); }
+    });
+  });
+}
+
+const tokscaleCapabilityResolver = createTokscaleCapabilityResolver({
+  warn: (message) => console.warn(message)
+});
+
+// A few tools surface as one umbrella client in our tracked-client list but as
+// several client ids inside tokscale. Antigravity splits its CLI source into
+// `antigravity-cli`, while Tokscale 4.13.0+ gives Oh My Pi's `.omp` source sole
+// ownership under `omp`. Widen the tokscale --client filter so those sub-source
+// rows aren't filtered out;
+// extractUsageFromTokscale's normalizeClientName folds them back into the umbrella
+// id. Every alias must be a real tokscale client id: an unknown --client value is
+// rejected with exit 2 and takes the whole scan down with it (verified on 4.7.0
+// and 4.8.0), so the shared mapping is not a free-form place to invent
+// sub-source names.
+// Fork-only clients are split out of argv before clap parses it, so they never
+// appear in --help even on the pinned fork. Ask the binary instead: a scan of
+// only those ids over an empty home exits 0 on the fork and fails with the
+// unknown-client exit code on an upstream build.
+async function forkOnlyClientsAccepted(command, options = {}, clients = FORK_ONLY_CLIENT_IDS) {
+  if (clients.length === 0) return false;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-tokscale-probe-'));
+  try {
+    await spawnTokscaleJson(
+      ['--json', '--client', clients.join(','), '--today', '--home', home, '--no-spinner'],
+      options.timeoutMs ?? TOKSCALE_CAPABILITY_PROBE_TIMEOUT_MS,
+      command,
+      undefined,
+      {
+        operation: 'tokscale capability probe',
+        terminationOptions: options.terminationOptions,
+        onTerminationUnconfirmed: options.onTerminationUnconfirmed
+      }
+    );
+    return true;
+  } catch (error) {
+    if (isUnknownTokscaleClientError(error)) return false;
+    throw error;
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+async function probeTokscaleCapabilities(command, options = {}) {
+  const supported = await spawnTokscaleHelp(command, options);
+  if (await forkOnlyClientsAccepted(command, options)) {
+    for (const client of FORK_ONLY_CLIENT_IDS) supported.add(client);
+  } else {
+    // A pre-CatPaw fork can still accept the existing client batch. Probe
+    // CatPaw separately without changing the other clients' batch rule.
+    const clientGroups = [FORK_ONLY_CLIENT_IDS.filter(client => client !== 'catpaw'), ['catpaw']];
+    for (const clients of clientGroups) {
+      if (await forkOnlyClientsAccepted(command, options, clients)) {
+        for (const client of clients) supported.add(client);
+      }
+    }
+  }
+  return supported;
+}
+
+function tokscaleClientFilter(clients) {
+  const ordered = [];
+  const seen = new Set();
+  for (const id of String(clients ?? '').split(',').map((value) => value.trim()).filter(Boolean)) {
+    for (const scanId of tokscaleScanClientIds(id)) {
+      if (!seen.has(scanId)) { seen.add(scanId); ordered.push(scanId); }
+    }
+  }
+  return ordered.join(',');
+}
+
+function resetTokscaleCapabilityCache() {
+  tokscaleCapabilityResolver.reset();
+  // Same category of state: what this binary identity was observed to support.
+  // Leaving it behind would keep a replaced binary pinned to the fallback grouping.
+  tokscaleWorkspaceGroupBySupport.clear();
+}
+
+// Exit code 2 alone is clap's generic "argument parsing failed" code, not a
+// --client-specific one — a malformed value for some other flag would exit
+// the same way. Requiring stderr to actually mention --client keeps a real
+// probe+retry reserved for the one flag this call site varies by binary
+// identity; anything else still surfaces as-is.
+// The workspace-joined grouping is a downstream addition: the vendored fork
+// returns the session's workspace on the same row, which is what lets one scan
+// answer "which project does this session belong to". An upstream build rejects
+// the value outright, so the fallback grouping is the one it has always known.
+const TOKSCALE_SESSION_GROUP_BY = 'client,session,model';
+const TOKSCALE_WORKSPACE_GROUP_BY = 'client,workspace,session,model';
+
+// Keyed by binary identity like the client-capability cache: a rejection is a
+// property of the binary, not of the tick, so one scan pays for the discovery
+// and every later scan on the same binary starts with the grouping it accepts.
+const tokscaleWorkspaceGroupBySupport = new Map();
+
+function workspaceGroupBySupported(identity) {
+  return tokscaleWorkspaceGroupBySupport.get(identity) !== false;
+}
+
+// Clap exits 1 with this message for an unparseable --group-by value. Matching
+// the message rather than the exit code alone keeps the retry reserved for the
+// one flag that varies by binary; anything else still surfaces as-is.
+function isUnknownTokscaleGroupByError(error) {
+  return Boolean(error) && /invalid group-by value/i.test(error?.tokscaleStderr || '');
+}
+
+function isUnknownTokscaleClientError(error) {
+  return Boolean(error)
+    && error.tokscaleExitCode === TOKSCALE_UNKNOWN_CLIENT_EXIT_CODE
+    && /--client/i.test(error.tokscaleStderr || '');
+}
+
+// The capability lookup is process-wide and must keep running so it can fill
+// the shared cache for a later collector. A superseded collector only gives up
+// its own wait: otherwise its in-flight tick keeps whenIdle() pending and holds
+// the replacement behind a probe it may no longer need.
+function waitForSharedCapabilityProbe(probe, signal) {
+  if (!signal) return Promise.resolve(probe);
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(probe).then(
+      (supported) => finish(resolve, supported),
+      (error) => finish(reject, error)
+    );
+  });
+}
+
+// Reactive, not proactive: a binary that recognizes every requested client
+// never pays for a capability probe. Only once tokscale has actually
+// rejected the CSV (exit 2) do we spend one `--help` probe (plus one empty
+// fork-only scan, see forkOnlyClientsAccepted) to learn what the resolved
+// binary really supports, then retry with just those ids. A probe
+// success is cached per binary identity so a later tick on the same binary
+// filters proactively instead of failing first; a probe failure is cached
+// too (and warned once) so we don't re-probe on every subsequent failure —
+// the original tokscale error surfaces instead, same as before this filter
+// existed.
+function retryWithKnownCapabilities(error, requested, command, emptyResult, retry, signal, options = {}) {
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  if (!isUnknownTokscaleClientError(error)) return Promise.reject(error);
+  // The resolver caches failed probes as well as successful ones. Do not bind
+  // this process-wide capability lookup to one collector's lifetime: aborting a
+  // superseded collector must not poison the cache for every later runtime.
+  const sharedProbe = tokscaleCapabilityResolver.probe(
+    command.identity,
+    () => probeTokscaleCapabilities(command, options)
+  );
+  return waitForSharedCapabilityProbe(sharedProbe, signal).then((supported) => {
+    throwIfAborted(signal);
+    if (!supported) return Promise.reject(error);
+    const filtered = filterSupportedClients(requested, supported);
+    if (filtered === requested) return Promise.reject(error);
+    if (!filtered) return emptyResult;
+    return retry(filtered);
+  });
+}
+
+function applyKnownCapabilityFilter(clientFilter, identity) {
+  const supported = tokscaleCapabilityResolver.known(identity);
+  return supported ? filterSupportedClients(clientFilter, supported) : clientFilter;
+}
+
+function runCursorAwareTokscale(clientFilter, operation, signal, lifecycleHeld = false) {
+  const includesCursor = String(clientFilter || '').split(',').includes('cursor');
+  return includesCursor && !lifecycleHeld ? withCursorLifecycle(operation, { signal }) : operation();
+}
+
+function runTokscale({
+  clients,
+  flags,
+  commandTimeoutMs,
+  signal,
+  terminationOptions,
+  onTerminationUnconfirmed,
+  customScanPaths,
+  homeDir,
+  offlinePricing = false,
+  workspaces = true,
+  offline = false,
+  cursorLifecycleHeld = false,
+  timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+}) {
+  throwIfAborted(signal);
+  const command = tokscaleCommand({ customScanPaths, homeDir });
+  const requested = tokscaleClientFilter(clients);
+  if (!requested) return Promise.resolve({ entries: [] });
+  const clientFilter = applyKnownCapabilityFilter(requested, command.identity);
+  if (!clientFilter) return Promise.resolve({ entries: [] });
+  // Asking for the join is what makes the scan resolve and label workspaces, so
+  // the Projects opt-out has to be applied here rather than on the way out: a
+  // scan that still resolved them and had its answer discarded would keep
+  // charging for a feature the user turned off. Session titles and activity
+  // bounds ride the plain session grouping too, so they are unaffected.
+  // Read per spawn rather than once per call: a rejection recorded by the
+  // fallback below must already be visible to the unknown-client retry, which
+  // would otherwise re-offer the grouping this binary just refused.
+  const groupBy = () => (workspaces && workspaceGroupBySupported(command.identity)
+    ? TOKSCALE_WORKSPACE_GROUP_BY
+    : TOKSCALE_SESSION_GROUP_BY);
+  const runArgs = (filter, grouping) => [...(offline || offlinePricing ? ['--offline'] : []), '--bucket-timezone', timeZone, '--json', '--client', filter, '--group-by', grouping, ...flags];
+  const subprocessOptions = {
+    operation: 'tokscale scan',
+    terminationOptions,
+    onTerminationUnconfirmed
+  };
+  const scan = (filter, grouping = groupBy()) => spawnTokscaleJson(
+    runArgs(filter, grouping),
+    commandTimeoutMs,
+    command,
+    signal,
+    subprocessOptions
+  ).catch((error) => {
+    if (!isUnknownTokscaleGroupByError(error)) return Promise.reject(error);
+    tokscaleWorkspaceGroupBySupport.set(command.identity, false);
+    throwIfAborted(signal);
+    return spawnTokscaleJson(
+      runArgs(filter, TOKSCALE_SESSION_GROUP_BY),
+      commandTimeoutMs,
+      command,
+      signal,
+      subprocessOptions
+    );
+  });
+  return runCursorAwareTokscale(clientFilter, () => (
+    scan(clientFilter).catch((error) => (
+      retryWithKnownCapabilities(error, requested, command, { entries: [] }, (filtered) => (
+        scan(filtered)
+      ), signal, {
+        terminationOptions,
+        onTerminationUnconfirmed
+      })
+    ))
+  ), signal, cursorLifecycleHeld || (offline && flags.includes('--home')));
+}
+
+function runTokscaleGraph({ clients, commandTimeoutMs, signal, terminationOptions, onTerminationUnconfirmed, customScanPaths, homeDir, offline = false, cursorLifecycleHeld = false, offlinePricing = false, timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone }) {
+  throwIfAborted(signal);
+  const command = tokscaleCommand({ customScanPaths, homeDir });
+  const requested = tokscaleClientFilter(clients);
+  if (!requested) return Promise.resolve({ contributions: [] });
+  const clientFilter = applyKnownCapabilityFilter(requested, command.identity);
+  if (!clientFilter) return Promise.resolve({ contributions: [] });
+  const runArgs = (filter) => [...(offline || offlinePricing ? ['--offline'] : []), 'graph', '--bucket-timezone', timeZone, '--client', filter, '--no-spinner'];
+  const subprocessOptions = {
+    operation: 'tokscale graph',
+    terminationOptions,
+    onTerminationUnconfirmed
+  };
+  return runCursorAwareTokscale(clientFilter, () => (
+    spawnTokscaleJson(runArgs(clientFilter), commandTimeoutMs, command, signal, subprocessOptions).catch((error) => (
+      retryWithKnownCapabilities(error, requested, command, { contributions: [] }, (filtered) => (
+        spawnTokscaleJson(runArgs(filtered), commandTimeoutMs, command, signal, subprocessOptions)
+      ), signal, {
+        terminationOptions,
+        onTerminationUnconfirmed
+      })
+    ))
+  ), signal, cursorLifecycleHeld);
+}
+
+function lookupModelPricing(modelId, commandTimeoutMs = 15000) {
+  const id = String(modelId || '').trim();
+  if (!id) return Promise.reject(new Error('lookupModelPricing: modelId is required'));
+  return spawnTokscaleJson(['--offline', 'pricing', id, '--json', '--no-spinner'], commandTimeoutMs);
+}
+
+// The collector's stamp and history.js's window/streak boundary have to be the same
+// calendar day or the aggregate re-keys what the collector wrote, so there is one
+// implementation rather than two formatters free to drift. Kept under the collector's
+// own name: it is exported and reads as the stamping side at its call sites.
+const localTodayKey = localDayKey;
+
+function collectionCalendarKey(now = new Date()) {
+  return `${Intl.DateTimeFormat().resolvedOptions().timeZone}|${now.getTimezoneOffset()}`;
+}
+
+function collectionDate(now) {
+  const value = typeof now === 'function' ? now() : now;
+  return value == null ? new Date() : new Date(value);
+}
+
+// Stamp each posted snapshot with the UTC instant its today/month windows end
+// (next local midnight / next month start, in this device's timezone). The hub
+// uses these to expire a frozen snapshot once it goes offline past a day/month
+// boundary, instead of counting stale "today" data forever (issue #37).
+function computePeriodWindows(now = new Date()) {
+  const startOfNextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
+  const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
+  const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  let timeZone = '';
+  try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) {}
+  return {
+    ...(timeZone ? { timeZone } : {}),
+    today: { key: localTodayKey(now), endsAt: startOfNextDay.toISOString() },
+    month: { key: monthKey, endsAt: startOfNextMonth.toISOString() }
+  };
+}
+
+// Copy freshly decorated identities/timestamps from `today` onto the same session
+// in the delta-derived periods. Used on watch ticks, where month/allTime are not
+// re-decorated: a session that started today is absent from the anchor, so its
+// project label would otherwise be missing from the broader-period breakdown.
+function sessionHasPeriodUsage(period, client, sessionId) {
+  return Number(period?.sessions?.[`${client}:${sessionId}`]?.totalTokens) > 0;
+}
+
+function propagateTodayProjects(today, periods, titleMetadata = {}) {
+  for (const [key, session] of Object.entries(today?.sessions || {})) {
+    if (!session) continue;
+    for (const [periodName, period] of Object.entries(periods)) {
+      const target = period?.sessions?.[key];
+      if (!target) continue;
+      const sources = titleMetadata.catalogProjects?.[periodName];
+      const owned = Boolean(sources?.[key] && target.projectId === sources[key]);
+      const meta = titleMetadata.metadataCache?.get(key);
+      if (titleMetadata.projectsFromToday || (session.projectId && (!target.projectId || owned)) || (owned && meta?.catalogProjectResolved)) {
+        if (session.projectId) {
+          target.projectId = session.projectId;
+          target.projectLabel = session.projectLabel;
+        } else {
+          delete target.projectId;
+          delete target.projectLabel;
+        }
+        if (sources) {
+          if (titleMetadata.catalogProjects.today?.[key]) sources[key] = session.projectId;
+          else delete sources[key];
+        }
+      }
+      // The fresh scan's title is authoritative and replaces the anchor's, like
+      // the context pair below: a Cursor rename arrives only through this path
+      // on watch ticks, so gap-filling would leave derived periods showing the
+      // old name until the hourly full scan. An authoritative removal clears
+      // the anchor; a metadata miss or transient reader failure keeps it.
+      if (session.title) target.title = session.title;
+      else if (titleMetadata.scanTitleClears?.has(key)) delete target.title;
+      else if (titleMetadata.invalidatedTitleKeys?.has(key) && target.title === titleMetadata.t3Titles?.[key]) delete target.title;
+      if (session.sessionKind && !target.sessionKind) target.sessionKind = session.sessionKind;
+      // Parent links are resolved per period: a parent's first rollout can fall
+      // outside today's window while the month still holds it, so the fresh
+      // link is not simply copied. A link the derived period can still resolve
+      // stays; one whose parent has no usage left there (its rollout was
+      // deleted, say) yields to the fresh link when that one resolves.
+      if (session.nativeSessionId) target.nativeSessionId = session.nativeSessionId;
+      if (session.t3ThreadId) target.t3ThreadId = session.t3ThreadId;
+      const parentClient = session.parentClient || session.client;
+      const targetParentClient = target.parentClient || target.client;
+      if (session.parentSessionId && (session.parentSessionId !== target.parentSessionId || parentClient !== targetParentClient)
+        && (!target.parentSessionId || (!sessionHasPeriodUsage(period, targetParentClient, target.parentSessionId)
+          && sessionHasPeriodUsage(period, parentClient, session.parentSessionId)))) {
+        target.parentSessionId = session.parentSessionId;
+        if (parentClient !== target.client) target.parentClient = parentClient;
+        else delete target.parentClient;
+      }
+      // Context occupancy is replaced rather than gap-filled: the derived
+      // periods carry the last full scan's reading, which is older than this
+      // tick's by construction. The copy is unconditional, including a cleared
+      // pair — the fresh scan is the authority, and a tick that read no valid
+      // pair (a DSH model switch drops the occupancy until the next usage chunk
+      // measures against the new window) must clear the stale one rather than
+      // leave the derived period showing a gauge the fresh scan dropped. The
+      // dock card reads month first, so it was the surface that displayed it.
+      target.contextWindow = Number(session.contextWindow) || 0;
+      target.contextTokens = Number(session.contextTokens) || 0;
+      // Home and Dock prefer month rows; carry the fresh observation (including
+      // an explicit cold reading) through anchored watch updates as well.
+      // An omitted observation is a metadata miss, not evidence of a cold cache.
+      if (Object.prototype.hasOwnProperty.call(session, 'promptCache')) {
+        target.promptCache = session.promptCache;
+      }
+      if ((Date.parse(session.lastUsedAt) || 0) >= (Date.parse(target.lastUsedAt) || 0)) {
+        if (Object.prototype.hasOwnProperty.call(session, 'latestModel')) target.latestModel = session.latestModel;
+        else if (Date.parse(session.lastUsedAt) > Date.parse(target.lastUsedAt)) target.latestModel = null;
+      }
+      if (isSessionReasoningEffortClient(session.client)) {
+        const freshAt = Date.parse(session.lastUsedAt) || 0;
+        const retainedAt = Date.parse(target.lastUsedAt) || 0;
+        if (freshAt >= retainedAt && Object.prototype.hasOwnProperty.call(session, 'reasoningEffort')) {
+          target.reasoningEffort = normalizeReasoningEffort(session.reasoningEffort);
+        } else if (freshAt > retainedAt) target.reasoningEffort = null;
+      }
+      // The turn boundary is copied in all three states, matching what the
+      // fresh scan said: `true` finished, `false` open, absent unknown. Copying
+      // only `true` left a stale `true` in a derived period after its session
+      // picked the next turn back up, and collapsing `false` into "delete" lost the
+      // one value that can clear it — the dock card reads month first, so it kept
+      // showing a finished session while today showed it running.
+      if (session.turnEnded === true || session.turnEnded === false) {
+        target.turnEnded = session.turnEnded;
+      } else {
+        delete target.turnEnded;
+      }
+      if (session.client === 'codex' && typeof session.waitingForInput === 'boolean') {
+        target.waitingForInput = session.waitingForInput;
+      }
+      if (session.startedAt && (!target.startedAt || Date.parse(session.startedAt) < Date.parse(target.startedAt))) {
+        target.startedAt = session.startedAt;
+      }
+      if (session.lastUsedAt && (!target.lastUsedAt || Date.parse(session.lastUsedAt) > Date.parse(target.lastUsedAt))) {
+        target.lastUsedAt = session.lastUsedAt;
+      }
+    }
+  }
+}
+
+// The process-wide rationing for cursor/antigravity syncs. Deliberately a single
+// module-scoped instance with no per-call override: the tokscale cache it guards
+// is one directory on disk, so a collector rebuilt by a settings change must
+// inherit whether its predecessor consumed or returned the shared allowance. A
+// second instance would split the state that decides a sync from the state that
+// schedules the catch-up waiting on it, which is the divergence this whole path
+// keeps being bitten by. Tests read it through the export to pin a floor without
+// driving a whole tick; a test wanting isolation builds its own with
+// createSelfSyncThrottle() and drives that directly, rather than threading one
+// back in here.
+const selfSyncThrottle = createSelfSyncThrottle();
+
+const { maybeSyncCursor } = createCursorSelfSync({ selfSyncThrottle });
+const { maybeSyncAntigravity } = createAntigravitySelfSync({ selfSyncThrottle, tokscaleCommand });
+
+const HISTORY_CAP_DAYS = 370;
+const HISTORY_TIMEOUT_MS = 60000;
+const DEFAULT_HISTORY_INTERVAL_MS = 15 * 60 * 1000;
+const HISTORY_INTERVAL_VALUES = new Set([5, 10, 15, 30, 60].map((minutes) => minutes * 60 * 1000));
+
+function normalizeHistoryIntervalMs(value) {
+  const parsed = Number(value);
+  return HISTORY_INTERVAL_VALUES.has(parsed) ? parsed : DEFAULT_HISTORY_INTERVAL_MS;
+}
+
+// History as the daily archive's graph gives it. Without a fresh graph the
+// archive cannot vouch for every active day, so the lifetime count is marked
+// incomplete. Null when the archive holds no days.
+function historyFromArchiveGraph(graph, { capDays, todayKey, complete }) {
+  const history = normalizeHistory(parseGraphResult(graph), { capDays, todayKey });
+  if (!complete) history.summary.activeDaysComplete = false;
+  return history.daily.length || history.monthly.length ? history : null;
+}
+
+// The archive alone, read-only, for a cold start to show until the first graph
+// lands. Capturing is the collector's job: a read here is not an observation.
+function archivedHistory({ timeZone, todayKey, capDays = HISTORY_CAP_DAYS, ...archiveOptions } = {}) {
+  const archive = readDailyHistoryArchive({ ...archiveOptions, timeZone });
+  const graph = graphFromDailyHistoryArchive([], archive, { timeZone, todayKey });
+  return historyFromArchiveGraph(graph, { capDays, todayKey, complete: false });
+}
+
+async function collectHistoryOnce(options) {
+  throwIfAborted(options.signal);
+  const startedAt = Date.now();
+  const attemptedAt = new Date(startedAt).toISOString();
+  let failureCode = null;
+  const reportStatus = (success) => {
+    try {
+      options.onHistoryStatus?.({
+        attemptedAt,
+        successAt: success ? new Date().toISOString() : null,
+        failureCode,
+        durationMs: Math.max(0, Date.now() - startedAt)
+      });
+    } catch (_) {
+      // Diagnostic observers must never affect history collection.
+    }
+  };
+  const clients = normalizeClientsCsv(options.clients);
+  if (options.historyEnabled === false) return null;
+  if (options.cursorGraphFailed) {
+    failureCode = 'history-graph-failed';
+    reportStatus(false);
+    return null;
+  }
+  let liveHistory = null;
+  const rawGraphs = [];
+  const runGraph = options.runGraph || runTokscaleGraph;
+  const capDays = Number.isFinite(options.capDays) ? options.capDays : HISTORY_CAP_DAYS;
+  const todayKey = options.todayKey || localTodayKey();
+  if (clients) {
+    try {
+      const graphJson = await runGraph({
+        clients,
+        timeZone: options.timeZone,
+        commandTimeoutMs: options.commandTimeoutMs || HISTORY_TIMEOUT_MS,
+        signal: options.signal
+      });
+      throwIfAborted(options.signal);
+      rawGraphs.push(graphJson);
+      liveHistory = normalizeHistory(parseGraphResult(graphJson), { capDays, todayKey });
+    } catch (error) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
+      failureCode = 'history-graph-failed';
+      if (typeof options.logger === 'function') options.logger(`tokscale graph failed: ${error.message}`);
+    }
+  }
+  if (options.cursorGraph && !failureCode) {
+    rawGraphs.push(options.cursorGraph);
+    const graphs = rawGraphs.map(parseGraphResult);
+    // Merge uncapped parsed days, then derive lifetime statistics once. Each
+    // graph's component summary remains scoped to its own client rows. Cursor
+    // events have no activity spans; preserve the native graph's time metrics.
+    liveHistory = normalizeHistory({
+      contributions: mergeDailyMaps(graphs.map(graph => ({ daily: graph.contributions }))),
+      ...(graphs[0]?.timeMetrics ? { timeMetrics: graphs[0].timeMetrics } : {})
+    }, { capDays, todayKey });
+  }
+  // Keep the supplemental ledger out of generic history retention too: a
+  // retained maximum would survive when a native rollout replaces this thread.
+  const withLocalHistory = (history) => {
+    // A failed native scan without retained history is no update, not a new
+    // Dots-only replacement for the device's last successful full history.
+    if (!history && failureCode === 'history-graph-failed') return null;
+    return options.codexLocalGraph
+      ? mergeHistories([history, normalizeHistory(parseGraphResult(options.codexLocalGraph), { capDays, todayKey })].filter(Boolean), { capDays, todayKey })
+      : history;
+  };
+  if (options.dailyHistoryArchiveEnabled) {
+    try {
+      const retainedGraph = retainDailyHistory(rawGraphs, {
+        ...(options.dailyHistoryArchiveOptions || {}),
+        liveDays: options.dailyHistoryLiveDays,
+        timeZone: options.timeZone,
+        pricingRevision: options.pricingRevision,
+        customPricingActive: options.customPricingActive,
+        todayKey,
+        capDays,
+        writeEnabled: options.dailyHistoryArchiveWriteEnabled
+      });
+      const result = historyFromArchiveGraph(retainedGraph, {
+        capDays, todayKey, complete: failureCode !== 'history-graph-failed'
+      });
+      reportStatus(failureCode === null);
+      return withLocalHistory(result);
+    } catch (error) {
+      failureCode = failureCode || 'daily-history-archive-failed';
+      if (liveHistory) liveHistory.summary.activeDaysComplete = false;
+      if (typeof options.logger === 'function') options.logger(`daily history archive failed: ${error.message}`);
+    }
+  }
+  if (!liveHistory) {
+    reportStatus(false);
+    return withLocalHistory(null);
+  }
+  const result = liveHistory.daily.length || liveHistory.monthly.length ? liveHistory : null;
+  reportStatus(failureCode === null);
+  return withLocalHistory(result);
+}
+
+function shouldIncludeHistory(nowMs, lastHistoryAtMs, historyIntervalMs, force, enabled = true) {
+  if (enabled === false) return false;
+  if (force) return true;
+  return nowMs - (lastHistoryAtMs || 0) >= historyIntervalMs;
+}
+// Full-history reports can outlive the short-window budget on large archives.
+// Keep a finite, independently configurable bound; stop/replacement still aborts
+// the subprocess through the same physical-close barrier.
+function allTimeScanTimeoutMs(options) {
+  const fallback = Math.max(5 * 60 * 1000, clampTimerDelayMs(options.commandTimeoutMs, 120 * 1000));
+  return clampTimerDelayMs(
+    options.allTimeTimeoutMs ?? (options.env || process.env).TOKEN_MONITOR_ALL_TIME_TIMEOUT_MS,
+    fallback
+  );
+}
+
+async function collectUsageOnce(options) {
+  throwIfAborted(options.signal);
+  const { clients, allTimeSince, commandTimeoutMs, deviceId, agentVersion = appVersion(), agentRuntime = '' } = options;
+  const allTimeTimeoutMs = allTimeScanTimeoutMs(options);
+  // One snapshot, one instant: capture the clock before any tokscale scan and
+  // reuse it for the today-window key and updatedAt, so a collection that
+  // straddles local midnight cannot pair a day-N today scan with a day-N+1
+  // window (issue #37 follow-up). Injectable for tests.
+  const collectedAt = collectionDate(options.now);
+  const calendarKey = collectionCalendarKey(collectedAt);
+  const periodWindows = computePeriodWindows(collectedAt);
+  const assertCollectionCalendar = () => {
+    if (collectionCalendarKey(collectedAt) !== calendarKey
+      || (options.expectedCalendarKey && options.expectedCalendarKey !== calendarKey)) {
+      throw new Error('System timezone changed during usage collection; retry the full scan');
+    }
+  };
+  assertCollectionCalendar();
+  const reportTerminationUnconfirmed = (operation) => {
+    try {
+      options.onDiagnosticEvent?.({
+        subsystem: 'collector',
+        code: 'subprocess-termination-unconfirmed',
+        operation
+      });
+    } catch (_) {
+      // Diagnostics observers must never affect collection or cancellation.
+    }
+  };
+  const projectsEnabled = options.projectsEnabled !== false;
+  const cursorSnapshot = options.cursorSnapshot;
+  const withoutCursor = (value) => normalizeClientsCsv(value).split(',').filter(client => client !== 'cursor').join(',');
+  const cursorReports = new WeakMap();
+  const extractScanBundle = (json, { partitions = true } = {}) => {
+    const cursor = cursorReports.get(json);
+    if (!cursor) return extractUsageBundleFromTokscale(json, { partitions });
+    const native = extractUsageBundleFromTokscale(json.native, { partitions });
+    const remote = extractUsageBundleFromTokscale(cursor, { partitions });
+    if (!partitions) return { period: mergePeriods(native.period, remote.period) };
+    const byClient = { ...native.byClient };
+    for (const [client, period] of Object.entries(remote.byClient)) {
+      byClient[client] = byClient[client] ? mergePeriods(byClient[client], period) : period;
+    }
+    return { period: mergePeriods(native.period, remote.period), byClient };
+  };
+  const runTokscaleScan = options.runTokscale || ((input) => runTokscale({
+    ...input,
+    workspaces: projectsEnabled,
+    offlinePricing: options.offlinePricing,
+    customScanPaths: options.customScanPaths,
+    homeDir: options.homeDir,
+    terminationOptions: options.subprocessTerminationOptions,
+    onTerminationUnconfirmed: () => reportTerminationUnconfirmed('tokscale-scan')
+  }));
+  const scanTitleClears = new Set();
+  const runTokscaleFn = async (input) => {
+    const includesCursor = cursorSnapshot && !input.flags.includes('--home')
+      && normalizeClientsCsv(input.clients).split(',').includes('cursor');
+    const scanInput = includesCursor ? { ...input, clients: withoutCursor(input.clients) }
+      : cursorSnapshot && input.flags.includes('--home') ? { ...input, offline: true } : input;
+    const json = scanInput.clients ? await runTokscaleScan({ ...scanInput, timeZone: periodWindows.timeZone }) : { entries: [] };
+    assertCollectionCalendar();
+    applyTokscaleSessionMetadata(json, { resolveProjects: projectsEnabled });
+    if (input.flags.includes('--today')) {
+      for (const session of Array.isArray(json?.sessions) ? json.sessions : []) {
+        if (session?.client === 'pi' && session.sessionId && session.title === '') {
+          scanTitleClears.add(`pi:${session.sessionId}`);
+        }
+      }
+    }
+    if (!includesCursor) return json;
+    const period = input.flags.includes('--today') ? 'today' : input.flags.includes('--month') ? 'month' : 'allTime';
+    const combined = { native: json };
+    cursorReports.set(combined, cursorSnapshot[period]);
+    return combined;
+  };
+  const runGraphScan = options.runGraph || ((input) => runTokscaleGraph({
+    ...input,
+    offlinePricing: options.offlinePricing,
+    customScanPaths: options.customScanPaths,
+    homeDir: options.homeDir,
+    terminationOptions: options.subprocessTerminationOptions,
+    onTerminationUnconfirmed: () => reportTerminationUnconfirmed('tokscale-graph')
+  }));
+  const runGraphFn = async (input) => {
+    const graph = await runGraphScan({ ...input, timeZone: periodWindows.timeZone });
+    assertCollectionCalendar();
+    return graph;
+  };
+  const collectWsl = options.collectWslUsage || collectWslUsageImpl;
+  const probeWslStateFn = options.probeWslState || probeWslStateImpl;
+  // Injectable only for the WSL-status gate, so tests can exercise the win32
+  // build path on a non-Windows CI box (the real process.platform stays for
+  // tokscale binary resolution, which is genuinely platform-bound).
+  const platformValue = options.platform || process.platform;
+  const osInfo = options.osInfo === undefined
+    ? hostOsInfo()
+    : normalizeOsInfo(options.osInfo);
+  const normalizedClients = normalizeClientsCsv(clients);
+  const localSessionMetadataDeps = {
+    ...(options.sessionMetadataDeps || {}),
+    env: options.env || options.sessionMetadataDeps?.env,
+    customScanPaths: options.customScanPaths,
+    metadataCache: new Map(),
+    resolvedSessionKeys: new Set(),
+    attemptedSessionKeys: new Set(),
+    invalidatedTitleKeys: new Set(),
+    t3Titles: {},
+    catalogTitleSources: {},
+    catalogProjects: { today: {}, month: {}, allTime: {}, labels: {} },
+    catalogProjectRows: new WeakSet()
+    // dshSessionFileCache is deliberately NOT reset here: it's module-level
+    // (declared with jsonlTimestampCache above) precisely so it survives
+    // across collectUsageOnce calls. These caches and sets start fresh each
+    // call; ticks recover catalog provenance from their local fallback below.
+  };
+  let sessionIdentitiesComplete = true;
+  const decorateLocalPeriods = (periods, { retryMisses = false, deferT3SessionParents = false } = {}) => applySessionMetadata(
+    periods,
+    options.homeDir || os.homedir(),
+    // Still unconditional: only the clients whose parser records a workspace come
+    // back from the scan attributed, so the resolvers stay the answer for the rest.
+    // applySessionMetadata skips the expensive path read per session, not per tick.
+    { ...localSessionMetadataDeps, retryMisses, deferT3SessionParents, resolveProjects: projectsEnabled }
+  );
+  const trackedClientSet = new Set(normalizedClients.split(',').filter(Boolean));
+  const targetClients = [...new Set(normalizeClientsCsv(options.targetClients).split(',').filter((client) => trackedClientSet.has(client)))];
+  const targetRequested = targetClients.length > 0;
+  const targetClientSet = new Set(targetClients);
+  const targetClientsCsv = targetClients.join(',');
+  let today = emptyPeriod();
+  let month = emptyPeriod();
+  let allTime = emptyPeriod();
+  let dailyHistoryLiveDays = options.dailyHistoryLiveDays;
+  let todayPartitions = null;
+  const anchor = options.todayOnlyAnchor;
+  const anchorUsed = Boolean(
+    anchor
+    && anchor.dateKey === localTodayKey(collectedAt)
+    && (!anchor.calendarKey || anchor.calendarKey === calendarKey)
+    && canTargetTodayPartitions(anchor, targetClients)
+  );
+  // Full-scan rows are native, even when their title matches an old override.
+  // Retain their fallback through the progressive metadata passes this tick.
+  if (!anchorUsed) localSessionMetadataDeps.scanTitleFallbacks = new WeakMap();
+  // Catalog state remains useful when a full scan cannot reuse usage totals.
+  // It supplies labels/provenance only; the scan still rebuilds every period.
+  const sessionMetadataFallback = options.sessionMetadataFallback || (anchorUsed ? anchor : null);
+  if (sessionMetadataFallback) {
+    localSessionMetadataDeps.t3Titles = sessionMetadataFallback.todayT3Titles || sessionMetadataFallback.t3Titles || {};
+    localSessionMetadataDeps.catalogTitleSources = sessionMetadataFallback.catalogTitleSources || {};
+    for (const period of ['today', 'month', 'allTime']) {
+      localSessionMetadataDeps.catalogProjects[period] = { ...sessionMetadataFallback.catalogProjects?.[period] };
+    }
+    localSessionMetadataDeps.catalogProjects.labels = { ...sessionMetadataFallback.catalogProjects?.labels };
+    localSessionMetadataDeps.catalogProjectFallbacks = sessionMetadataFallback;
+  }
+  const emitProgress = (periods) => {
+    if (typeof options.onProgress !== 'function') return;
+    try { options.onProgress({ ...periods, periodWindows, updatedAt: new Date().toISOString() }); } catch (_) {}
+  };
+  if (normalizedClients) {
+    const selectedSyncClients = targetRequested ? targetClientsCsv : normalizedClients;
+    const syncClients = cursorSnapshot ? withoutCursor(selectedSyncClients) : selectedSyncClients;
+    await maybeSyncCursor(syncClients, options.logger, {
+      minIntervalMs: selfSyncThrottle.minIntervalForTick(options, 'cursor'),
+      explicit: selfSyncSelected(options.forceSelfSync, 'cursor'),
+      signal: options.signal,
+      timeoutMs: options.selfSyncTimeoutMs,
+      terminationOptions: options.subprocessTerminationOptions,
+      onTerminationUnconfirmed: () => reportTerminationUnconfirmed('cursor-sync'),
+      onFailure: options.onSelfSyncFailed
+    });
+    await maybeSyncAntigravity(syncClients, options.logger, options.homeDir || os.homedir(), {
+      minIntervalMs: selfSyncThrottle.minIntervalForTick(options, 'antigravity'),
+      run: options.runAntigravitySync,
+      syncLockPath: options.antigravitySyncLockPath,
+      signal: options.signal,
+      timeoutMs: options.selfSyncTimeoutMs,
+      terminationOptions: options.subprocessTerminationOptions,
+      onTerminationUnconfirmed: () => reportTerminationUnconfirmed('antigravity-sync'),
+      onFailure: options.onSelfSyncFailed
+    });
+    throwIfAborted(options.signal);
+    throwIfAborted(options.signal);
+    if (anchorUsed) {
+      // Anchored tick (watch-triggered): every tokscale period scan costs the
+      // same full load + filter, so scan only --today and update the broader
+      // windows exactly via applyPeriodDelta — one spawn instead of three.
+      const scanClients = targetRequested ? targetClientsCsv : normalizedClients;
+      let freshPartitions = Object.create(null);
+      let useTargetedPartitions = targetRequested;
+      if (scanClients) {
+        const todayJson = await runTokscaleFn({ clients: scanClients, flags: ['--today'], commandTimeoutMs, signal: options.signal });
+        throwIfAborted(options.signal);
+        const bundle = extractScanBundle(todayJson);
+        freshPartitions = bundle.byClient;
+        const unattributed = freshPartitions[UNATTRIBUTED_USAGE_CLIENT];
+        const attributedClients = Object.keys(freshPartitions).filter((client) => client !== UNATTRIBUTED_USAGE_CLIENT);
+        const missingTargets = targetClients.length > 1
+          ? targetClients.filter((client) => !Object.prototype.hasOwnProperty.call(freshPartitions, client))
+          : [];
+        // If every target is missing, a targeted retry would repeat the same
+        // scan without resolving whether the entire union was incomplete.
+        const allTargetsMissing = missingTargets.length > 0 && missingTargets.length === targetClients.length;
+        let hasUnsafeTargetedResult = (
+          periodHasUsage(unattributed)
+          || attributedClients.some((client) => !targetClientSet.has(client))
+          || allTargetsMissing
+          || missingTargets.some((client) => periodHasUsage(anchor.todayPartitions[client]))
+        );
+
+        // A union can hide cross-attribution, even for a client with no earlier
+        // usage today. Verify that previously empty, omitted targets still
+        // return no usage before accepting the union.
+        if (!hasUnsafeTargetedResult && missingTargets.length > 0) {
+          const missingTodayJson = await runTokscaleFn({
+            clients: missingTargets.join(','),
+            flags: ['--today'],
+            commandTimeoutMs,
+            signal: options.signal
+          });
+          throwIfAborted(options.signal);
+          hasUnsafeTargetedResult = periodHasUsage(extractScanBundle(missingTodayJson, { partitions: false }).period);
+        }
+
+        if (targetRequested && hasUnsafeTargetedResult) {
+          // Rebuild all Today partitions when attribution is unsafe or the
+          // union omitted usage. Merging a retry into the union could double count.
+          const fullTodayJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--today'], commandTimeoutMs, signal: options.signal });
+          throwIfAborted(options.signal);
+          freshPartitions = extractScanBundle(fullTodayJson).byClient;
+          useTargetedPartitions = false;
+        } else if (targetRequested) {
+          // Empty tokscale output uses the unattributed fallback shape. Keep the
+          // anchor's real unattributed partition while clearing the target.
+          delete freshPartitions[UNATTRIBUTED_USAGE_CLIENT];
+        }
+      }
+      todayPartitions = useTargetedPartitions
+        ? replaceTodayPartitions(anchor.todayPartitions, freshPartitions, targetClients)
+        : completeTodayPartitions(freshPartitions, normalizedClients);
+      today = mergeTodayPartitions(todayPartitions);
+      if (useTargetedPartitions) {
+        for (const [key, session] of Object.entries(today.sessions || {})) {
+          if (!targetClientSet.has(session.client) && session.projectId === localSessionMetadataDeps.catalogProjects.today[key]) {
+            localSessionMetadataDeps.catalogProjectRows.add(session);
+          }
+        }
+      }
+      month = applyPeriodDelta(anchor.month, today, anchor.today);
+      allTime = applyPeriodDelta(anchor.allTime, today, anchor.today);
+    } else if (normalizedClients) {
+      // Serial on purpose: concurrent scans triple the peak CPU/IO load, which
+      // is what let the issue #15 self-trigger loop spike tokscale past 500% CPU.
+      const todayJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--today'], commandTimeoutMs, signal: options.signal });
+      throwIfAborted(options.signal);
+      const todayBundle = extractScanBundle(todayJson);
+      today = todayBundle.period;
+      todayPartitions = todayBundle.byClient;
+      if (typeof options.onProgress === 'function') decorateLocalPeriods({ today });
+      emitProgress({ today });
+      const monthJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--month'], commandTimeoutMs, signal: options.signal });
+      throwIfAborted(options.signal);
+      month = extractScanBundle(monthJson, { partitions: false }).period;
+      if (typeof options.onProgress === 'function') decorateLocalPeriods({ today, month });
+      emitProgress({ today, month });
+      const allTimeJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--since', allTimeSince], commandTimeoutMs: allTimeTimeoutMs, signal: options.signal });
+      throwIfAborted(options.signal);
+      allTime = extractScanBundle(allTimeJson, { partitions: false }).period;
+    }
+    // Always decorate: session timestamps drive the recency sort regardless of the
+    // Projects opt-out (issue #182). decorateLocalPeriods gates only project identity
+    // on projectsEnabled, so opting out still costs the timestamp backfill and nothing
+    // more.
+    if (anchorUsed) {
+      // Watch tick: `today` is a fresh scan and must be decorated, but month/
+      // allTime are derived from the last full-scan anchor and already carry each
+      // session's project label + timestamps through applyPeriodDelta. Decorating
+      // them again would re-stat every historical session file every few seconds
+      // (the perceived UI stutter). Decorate only today, then propagate its freshly
+      // resolved identities onto sessions that started today (absent from the anchor).
+      // Upgrade retained identity metadata once, on the usage worker, without
+      // rescanning tokens or moving the frozen delta baseline.
+      decorateLocalPeriods({ today }, { retryMisses: true, deferT3SessionParents: true });
+      const upgradeIdentities = anchor.sessionIdentityVersion !== SESSION_IDENTITY_VERSION;
+      if (upgradeIdentities) {
+        applySessionIdentities({ month, allTime }, options.homeDir || os.homedir(), { ...localSessionMetadataDeps, deferT3SessionParents: true });
+      }
+      propagateTodayProjects(today, { month, allTime }, { ...localSessionMetadataDeps, t3Titles: anchor.t3Titles, scanTitleClears });
+      // A delegated child may be new today while its idle parent exists only in
+      // the broader anchor. Resolve app links without re-reading transcripts.
+      const targets = upgradeIdentities
+        ? new Set([month, allTime].flatMap(period => Object.values(period.sessions || {}))) : new Set();
+      for (const key of Object.keys(today.sessions || {})) {
+        for (const period of [today, month, allTime]) if (period.sessions?.[key]) targets.add(period.sessions[key]);
+      }
+      sessionIdentitiesComplete = applyT3SessionParents({ today, month, allTime }, options.homeDir || os.homedir(), localSessionMetadataDeps, targets);
+    } else {
+      sessionIdentitiesComplete = decorateLocalPeriods({ today, month, allTime }, { retryMisses: true });
+    }
+    todayPartitions = completeTodayPartitions(todayPartitions, normalizedClients);
+    // Partition metadata is internal but must remain as complete as the public
+    // period: a later targeted tick re-merges these sessions into `today`.
+    propagateTodayProjects(today, Object.values(todayPartitions), { ...localSessionMetadataDeps, projectsFromToday: true });
+  }
+
+  // Decoration can replace text after the scan's normalization. Today was
+  // freshly decorated even on a watch tick. Normalize broader periods only on
+  // full scans; delta merges already normalize the sessions Today touched.
+  today = normalizePeriod(today);
+  if (!anchorUsed && normalizedClients) {
+    month = normalizePeriod(month);
+    allTime = normalizePeriod(allTime);
+  }
+
+  // WSL contribution (Windows only; no-op elsewhere). Full tick scans running WSL
+  // homes; watch tick reuses the frozen snapshot so the Windows-only delta anchor
+  // above stays exact (issue #15). Merged before deriveClientStatus so a client
+  // that only exists inside WSL still reports as active.
+  //
+  // Three WSL refresh modes:
+  // 1. refreshWsl (interval anchored tick): scan WSL fresh — the 5-minute interval
+  //    is too long to let WSL go stale, but re-scanning tokscale is avoided.
+  // 2. wslAnchor (watch anchored tick): reuse the frozen snapshot — WSL is heavy
+  //    and watch ticks fire every few seconds.
+  // 3. !anchorUsed (full scan): scan WSL as part of the complete rescan.
+  const windowsPeriods = { today, month, allTime };
+  let wslBundle = emptyWslBundle();
+  let wslDetected = [];
+  if (normalizedClients && options.wslScanEnabled === true) {
+    if (options.refreshWsl) {
+      const wslResult = await collectWsl({
+        clients: normalizedClients,
+        trackedClients: normalizedClients,
+        allTimeSince,
+        commandTimeoutMs,
+        allTimeTimeoutMs,
+        signal: options.signal,
+        runTokscale: runTokscaleFn,
+        logger: options.logger,
+        decoratePeriods: (periods, home) => applySessionMetadata(periods, home, { scopedHome: true, resolveProjects: projectsEnabled })
+      });
+      wslBundle = wslResult.bundle;
+      wslDetected = wslResult.detected;
+    } else if (options.wslAnchor) {
+      wslBundle = options.wslAnchor;
+    } else if (!anchorUsed) {
+      const wslResult = await collectWsl({
+        clients: normalizedClients,
+        trackedClients: normalizedClients,
+        allTimeSince,
+        commandTimeoutMs,
+        allTimeTimeoutMs,
+        signal: options.signal,
+        runTokscale: runTokscaleFn,
+        logger: options.logger,
+        decoratePeriods: (periods, home) => applySessionMetadata(periods, home, { scopedHome: true, resolveProjects: projectsEnabled })
+      });
+      wslBundle = wslResult.bundle;
+      wslDetected = wslResult.detected;
+    }
+  }
+  // The host periods are already normalized. Re-normalizing them here walked
+  // every retained session on each watch tick; only the WSL overlay is new.
+  today = mergeNormalizedPeriods(windowsPeriods.today, wslBundle.today);
+  month = mergeNormalizedPeriods(windowsPeriods.month, wslBundle.month);
+  allTime = mergeNormalizedPeriods(windowsPeriods.allTime, wslBundle.allTime);
+  throwIfAborted(options.signal);
+
+  // The renderer intentionally uses the live today period while a day is in
+  // progress. Callers that do not defer capture persist the largest complete
+  // live snapshot here; startCollector defers it until after transformUsage so
+  // the saved value matches the period delivered to the renderer.
+  if (
+    options.historyEnabled !== false
+    && options.dailyHistoryArchiveEnabled
+    && options.deferLiveHistoryCapture !== true
+  ) {
+    try {
+      const retainedLive = retainLiveDailyHistory(today, {
+        ...(options.dailyHistoryArchiveOptions || {}),
+        liveDays: dailyHistoryLiveDays,
+        timeZone: periodWindows.timeZone,
+        todayKey: periodWindows.today.key,
+        pricingRevision: options.pricingRevision,
+        writeEnabled: options.dailyHistoryArchiveWriteEnabled
+      });
+      dailyHistoryLiveDays = (retainedLive.calendars?.[periodWindows.timeZone] || retainedLive).liveDays || {};
+    } catch (error) {
+      if (typeof options.logger === 'function') options.logger(`daily live history archive failed: ${error.message}`);
+    }
+  }
+
+  // WSL attribution (Windows only; null elsewhere). detected = markers found,
+  // withData = clients whose WSL scan or local parser returned tokens. The gap
+  // is the diagnostic (e.g. Hermes detected but unreadable over 9P).
+  //
+  // Like wslBundle, this is FROZEN between full scans: anchored watch ticks
+  // (which skip the WSL scan) reuse the snapshot via options.wslStatus instead
+  // of re-probing — otherwise every few-second watch tick would spawn wsl.exe
+  // and stall the fast refresh path (issue #15's load concern).
+  let wslStatus = null;
+  if (platformValue === 'win32' && normalizedClients) {
+    const reuseFrozen = !options.refreshWsl && options.wslAnchor && options.wslStatus;
+    if (options.wslScanEnabled !== true) {
+      wslStatus = { state: 'disabled', detected: [], withData: [] };
+    } else if (reuseFrozen) {
+      wslStatus = options.wslStatus;
+    } else {
+      const probe = probeWslStateFn({});
+      if (probe !== 'ok') {
+        wslStatus = { state: probe, detected: [], withData: [] };
+      } else {
+        const withData = Object.keys(wslBundle.allTime.clients || {});
+        const state = withData.length > 0 ? 'active' : 'no-data';
+        wslStatus = { state, detected: wslDetected, withData };
+      }
+    }
+  }
+
+  // This contribution is durable but has no rollout file. Keep it outside
+  // windowsPeriods/todayPartitions so exact native watch deltas stay native.
+  let codexLocalView = null;
+  if (trackedClientSet.has('codex') && options.codexLocalUsageEnabled !== false
+    && options.codexDotsVisible !== false) {
+    try {
+      codexLocalView = await readLocalUsageView({
+        ...options, store: options.codexLocalUsageStore, now: collectedAt,
+        nativePeriod: allTime, projectIdentity,
+        resolvePricing: (rows) => resolveLocalUsagePricing(rows, {
+          ...options, lookupModelPricing: options.lookupModelPricing || lookupModelPricing,
+          commandTimeoutMs: options.pricingTimeoutMs, pricingRevision: options.pricingRevision ?? pricingFingerprint(options)
+        })
+      });
+      throwIfAborted(options.signal);
+      if (codexLocalView.sessionKeys.length) {
+        today = mergeNormalizedPeriods(today, codexLocalView.today);
+        month = mergeNormalizedPeriods(month, codexLocalView.month);
+        allTime = mergeNormalizedPeriods(allTime, codexLocalView.allTime);
+      }
+      options.onCodexLocalUsageComputed?.(codexLocalView);
+    } catch (_error) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
+      try {
+        options.onDiagnosticEvent?.({ subsystem: 'collector', code: 'codex-local-usage-read-failed' });
+      } catch (_) {
+        // Diagnostic observers must not turn a recoverable ledger error into a failed tick.
+      }
+    }
+  }
+
+  // One filesystem probe per tick, shared by the legacy status and the health
+  // record below. Probing twice cost a second pass over every client's roots —
+  // including the per-workspace walk Copilot needs — and let one snapshot report
+  // a directory as both present and absent when it appeared between the two.
+  const sourceChecks = clientSourceChecks(normalizedClients, {
+    customScanPaths: options.customScanPaths,
+    env: options.env,
+    homeDir: options.homeDir,
+    platform: platformValue,
+    wslDetected: wslStatus?.detected
+  });
+
+  const summary = {
+    deviceId,
+    hostname: os.hostname(),
+    platform: `${process.platform}-${process.arch}`,
+    deviceKind: hostDeviceKind(),
+    ...(osInfo.name ? { osName: osInfo.name } : {}),
+    ...(osInfo.version ? { osVersion: osInfo.version } : {}),
+    updatedAt: collectedAt.toISOString(),
+    agentVersion,
+    ...(agentRuntime ? { agentRuntime } : {}),
+    projectsEnabled,
+    trackedClients: normalizedClients ? normalizedClients.split(',') : [],
+    clientStatus: deriveClientStatus(normalizedClients, allTime, { sourceChecks }),
+    wslStatus,
+    periodWindows,
+    historyAvailable: options.historyEnabled !== false,
+    // Private archive hint: these three report requests finished this tick.
+    sessionUsageArchiveFullScan: !anchorUsed,
+    today,
+    month,
+    allTime
+  };
+  // The request ledger is this source's archive. A second per-session archive
+  // would resurrect its contribution after a native rollout takes precedence.
+  if (codexLocalView) summary.codexLocalSessionKeys = codexLocalView.sessionKeys;
+  if (options.reasonixNativeSessionsEnabled === true && trackedClientSet.has('reasonix')) {
+    try {
+      const nativeCache = options.reasonixNativeSessionCache || createReasonixNativeSessionCache({
+        env: options.env || process.env,
+        homeDir: options.homeDir || os.homedir(),
+        platform: platformValue,
+        cwdDir: options.cwdDir || process.cwd(),
+        projectIdentity
+      });
+      const nativeView = nativeCache.getView({ now: collectedAt, projectsEnabled, allTimeSince });
+      summary.nativeSessions = nativeView.sessions;
+      summary.nativeProjects = nativeView.projects;
+    } catch (error) {
+      if (typeof options.logger === 'function') options.logger(`reasonix native session scan failed: ${error.message}`);
+      const empty = emptyNativeView();
+      summary.nativeSessions = empty.sessions;
+      summary.nativeProjects = empty.projects;
+    }
+  }
+  if (typeof options.onAnchorComputed === 'function') {
+    // Reuse the existing catalog-title ledger (historically named t3Titles)
+    // for summary overrides too. Provenance never enters published rows.
+    const t3Titles = { ...localSessionMetadataDeps.t3Titles };
+    for (const key of localSessionMetadataDeps.invalidatedTitleKeys) t3Titles[key] = null;
+    for (const [key, meta] of localSessionMetadataDeps.metadataCache) {
+      if (meta.t3Title || meta.catalogTitle) t3Titles[key] = meta.t3Title || meta.catalogTitle;
+    }
+    const catalogTitleSources = { ...localSessionMetadataDeps.catalogTitleSources };
+    for (const [key, meta] of localSessionMetadataDeps.metadataCache) {
+      if (meta.catalogTitleSource) catalogTitleSources[key] = meta.catalogTitleSource;
+    }
+    const catalogProjects = localSessionMetadataDeps.catalogProjects;
+    for (const period of ['today', 'month', 'allTime']) {
+      for (const [key, id] of Object.entries(catalogProjects[period])) {
+        const label = windowsPeriods[period]?.sessions?.[key]?.projectLabel;
+        if (label) catalogProjects.labels[id] = label;
+      }
+    }
+    options.onAnchorComputed({
+      sessionIdentityVersion: sessionIdentitiesComplete ? SESSION_IDENTITY_VERSION : (anchor?.sessionIdentityVersion || 1),
+      windowsPeriods,
+      todayPartitions,
+      t3Titles,
+      catalogTitleSources,
+      catalogProjects,
+      wslBundle,
+      wslStatus,
+      ...(summary.nativeSessions ? { nativeSessions: summary.nativeSessions } : {}),
+      ...(summary.nativeProjects ? { nativeProjects: summary.nativeProjects } : {})
+    });
+  }
+  assertCollectionCalendar();
+  if (options.historyEnabled === false) {
+    summary.history = null;
+  } else if (options.includeHistory) {
+    throwIfAborted(options.signal);
+    const history = await collectHistoryOnce({
+      clients: cursorSnapshot ? withoutCursor(normalizedClients) : normalizedClients,
+      cursorGraph: cursorSnapshot?.graph,
+      // Revision 0 has no complete Cursor graph yet. Retain the previous
+      // cross-client History until the initial offline snapshot is ready.
+      cursorGraphFailed: cursorSnapshot?.revision === 0 || cursorSnapshot?.graphFailed,
+      codexLocalGraph: codexLocalView?.graph || null,
+      historyEnabled: options.historyEnabled,
+      commandTimeoutMs: options.historyTimeoutMs,
+      capDays: options.historyCapDays,
+      timeZone: periodWindows.timeZone,
+      todayKey: periodWindows.today.key,
+      runGraph: runGraphFn,
+      signal: options.signal,
+      dailyHistoryArchiveEnabled: options.dailyHistoryArchiveEnabled,
+      dailyHistoryArchiveWriteEnabled: options.dailyHistoryArchiveWriteEnabled,
+      dailyHistoryArchiveOptions: options.dailyHistoryArchiveOptions,
+      dailyHistoryLiveDays,
+      pricingRevision: options.pricingRevision,
+      customPricingActive: options.customPricingActive,
+      onHistoryStatus: options.onHistoryStatus,
+      logger: options.logger
+    });
+    throwIfAborted(options.signal);
+    assertCollectionCalendar();
+    if (history) summary.history = history;
+  }
+  // After history, so `lastActivityDay` can come from the daily buckets this
+  // scan already produced rather than from a second source of truth.
+  const clientHealth = deriveClientHealth(normalizedClients, allTime, {
+    sourceChecks,
+    wslStatus,
+    observedAt: collectedAt,
+    lastActivityDays: mergeClientActivityDays(
+      options.lastActivityDays,
+      summary.history,
+      today,
+      localTodayKey(collectedAt)
+    )
+  });
+  if (clientHealth) summary.clientHealth = clientHealth;
+  const activityObservedAt = Date.now();
+  const activityProviders = sessionActivityProvidersFor(trackedClientSet);
+  const activityOptions = activityProviders.length ? activityReadOptions(options, {
+    env: options.env || options.sessionMetadataDeps?.env, homeDir: options.homeDir || os.homedir(),
+    customScanPaths: options.customScanPaths, platform: options.platform, now: activityObservedAt
+  }, activityProviders) : {};
+  const activitySummary = await refreshSessionActivity(summary, activityProviders, options, activityOptions, {
+    isCurrent: () => { throwIfAborted(options.signal); return true; },
+    now: () => activityObservedAt
+  });
+  // Activity is observed after scans; it must not re-date their accounting
+  // snapshot if that read crosses midnight. Observations retain their own clock.
+  assertCollectionCalendar();
+  const result = require('./sessionActivityProjection').materializeActivity(activitySummary);
+  return result.updatedAt === summary.updatedAt ? result : { ...result, updatedAt: summary.updatedAt };
+}
+
+function activityReadOptions(options, extras, providers) {
+  const base = { ...options.sessionMetadataDeps, ...extras };
+  const readProcessStarts = createProcessStartBatch(base.readProcessStarts);
+  const shared = { ...base, readProcessStarts };
+  const drivers = [...new Set(providers.map((entry) => entry.t3Driver).filter(Boolean))];
+  return { ...shared, ...(drivers.length ? { t3Activity: readT3Activities(shared, drivers) } : {}) };
+}
+
+// Whether each tracked client has at least one data directory on disk. Takes
+// pre-computed checks when the caller already has them: a tick derives the
+// legacy status and the health record from one probe, so the two cannot
+// disagree about a directory created between two scans of the same snapshot.
+function clientDataDirPresence(clientsCsv, options = {}) {
+  const presence = {};
+  for (const [client, checks] of Object.entries(options.sourceChecks || clientSourceChecks(clientsCsv, options))) {
+    presence[client] = checks.some((check) => check.exists);
+  }
+  return presence;
+}
+
+// Pure detection-status derivation, given the two existing signals per client:
+// `active`  — tokscale read all-time usage for it,
+// `waiting` — its data directory exists but no usage was found,
+// `missing` — no data directory on disk.
+function statusFromSignals(clients, presence, usageClients) {
+  const status = {};
+  for (const client of clients) {
+    if (Number(usageClients?.[client] || 0) > 0) status[client] = 'active';
+    else if (presence?.[client]) status[client] = 'waiting';
+    else status[client] = 'missing';
+  }
+  return status;
+}
+
+function deriveClientStatus(clientsCsv, allTimePeriod, options = {}) {
+  const clients = String(clientsCsv || '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
+  return statusFromSignals(clients, clientDataDirPresence(clientsCsv, options), allTimePeriod?.clients || {});
+}
+
+// The most recent day each client has recorded usage on, read out of the daily
+// history buckets this scan already produced. Deliberately not called "last
+// used": it is the newest day the collector *holds data for*, which is the
+// honest answer to "is this tool quiet, or are we failing to read it". Per-turn
+// timestamps would be the stronger signal and tokscale does not expose them.
+function clientActivityDaysFromHistory(history) {
+  const days = {};
+  for (const bucket of history?.daily || []) {
+    const key = String(bucket?.date || '').slice(0, 10);
+    if (!key) continue;
+    for (const [rawClient, usage] of Object.entries(bucket?.perClient || {})) {
+      if (Number(usage?.tokens || 0) <= 0) continue;
+      // Folds tokscale's aliases onto the umbrella id, so an antigravity-cli day
+      // counts as an antigravity day — the same id the health record is keyed on.
+      const client = normalizeClientName(rawClient);
+      if (!client) continue;
+      if (!days[client] || key > days[client]) days[client] = key;
+    }
+  }
+  return days;
+}
+
+// A history refresh runs on its own slower cadence than a usage tick, so a tick
+// that skipped it keeps the caller's previous map rather than blanking the
+// field. Merged per client rather than swapped wholesale: a refresh only carries
+// the clients its window still shows, so one that no longer returns a client's
+// days must not erase what the last one knew about it. Today's already-collected period is also authoritative for the date: it
+// closes the cadence gap without another graph scan. A day only ever moves
+// forward, so the newest value wins where sources overlap.
+function mergeClientActivityDays(previous, history, todayPeriod, todayKey) {
+  const merged = { ...(previous || {}) };
+  const candidates = clientActivityDaysFromHistory(history);
+  const currentDay = String(todayKey || '').slice(0, 10);
+  if (currentDay) {
+    for (const [rawClient, tokens] of Object.entries(todayPeriod?.clients || {})) {
+      if (Number(tokens || 0) <= 0) continue;
+      const client = normalizeClientName(rawClient);
+      if (client && (!candidates[client] || currentDay > candidates[client])) {
+        candidates[client] = currentDay;
+      }
+    }
+  }
+  for (const [client, day] of Object.entries(candidates)) {
+    // Per client, newest wins. A plain spread would let a fresh-but-older value
+    // push a known day backwards — history is a rolling window and a refresh can
+    // legitimately return a shorter one, so "fresh" does not imply "later".
+    if (!merged[client] || day > merged[client]) merged[client] = day;
+  }
+  return merged;
+}
+
+// Per-client diagnostics. Every input is a filesystem or subprocess observation
+// that only this process can make, which is why the record is built here;
+// clientHealth.js owns the shape, the enums and the validation the hub re-runs.
+//
+// Detail is attached only to clients that are not healthy. A working client is
+// fully described by the fixed core, and this record is per client per device on
+// a document the hub keeps — so "which of Copilot's two roots is missing" is
+// worth its bytes exactly when something is wrong.
+function deriveClientHealth(clientsCsv, allTimePeriod, options = {}) {
+  const clients = String(clientsCsv || '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
+  if (clients.length === 0) return null;
+  // Injectable so a test can state the filesystem instead of depending on one:
+  // every `overall` below turns on whether a directory exists, which makes the
+  // developer's machine and a CI runner disagree about the same input.
+  const checksByClient = options.sourceChecks || clientSourceChecks(clientsCsv);
+  const usageClients = allTimePeriod?.clients || {};
+  const wslDetected = new Set(options.wslStatus?.detected || []);
+  const wslWithData = new Set(options.wslStatus?.withData || []);
+  const activityDays = options.lastActivityDays || {};
+  const throttle = options.selfSyncThrottle || selfSyncThrottle;
+  const result = {};
+  for (const client of clients) {
+    const checks = checksByClient[client] || [];
+    const detected = checks.filter((check) => check.exists);
+    const liveTokens = Number(usageClients[client] || 0);
+    const sync = SELF_SYNCED_CLIENTS.has(client) ? throttle.syncStatus(client) : null;
+    const entry = {
+      source: {
+        state: checks.length === 0 ? 'unknown' : (detected.length > 0 ? 'detected' : 'missing'),
+        detectedCount: detected.length,
+        checkedCount: checks.length
+      },
+      collection: { state: sync ? sync.state : 'direct' },
+      data: { liveTokens: liveTokens > 0 ? liveTokens : 0 }
+    };
+    // Kept even for a healthy self-synced client: "last synced two minutes ago"
+    // is the answer to "why is today still 0", not a fault report.
+    if (sync?.lastAttemptAt) entry.collection.lastAttemptAt = new Date(sync.lastAttemptAt).toISOString();
+    if (sync?.lastSuccessAt) entry.collection.lastSuccessAt = new Date(sync.lastSuccessAt).toISOString();
+    if (sync?.state === 'failed') {
+      if (sync.failureStage) entry.collection.syncFailureStage = sync.failureStage;
+      if (sync.detailCode) entry.collection.syncDetailCode = sync.detailCode;
+      if (sync.exitCode !== null && sync.exitCode !== undefined) entry.collection.syncExitCode = sync.exitCode;
+    }
+    const activityDay = activityDays[client];
+    if (activityDay) entry.data.lastActivityDay = activityDay;
+    const overall = deriveClientOverall(entry);
+    if (overall !== 'healthy') {
+      if (checks.length > 0 && detected.length < checks.length) {
+        entry.source.checks = checks.map(({ id, exists }) => ({ id, exists }));
+      }
+      const codes = [];
+      // Only "nothing at all" is a fault. A client's roots are alternatives, not
+      // dependencies — Antigravity's IDE cache, native sources and CLI data are
+      // three ways to have it installed, and so are Kiro's three — so a partial
+      // set is the normal shape of a normal install. `checks` still ships as
+      // neutral evidence of which ones were found.
+      if (checks.length > 0 && detected.length === 0) codes.push('source-missing');
+      if (sync?.detailCode === 'sync-lock-present') codes.push('sync-lock-present');
+      else if (sync?.failureCode) codes.push(sync.failureCode);
+      if (detected.length > 0 && liveTokens <= 0) codes.push('no-usage-observed');
+      // States a fact, not a cause: a marker without usage can equally mean the
+      // tool is installed in that distro and simply unused.
+      if (wslDetected.has(client) && !wslWithData.has(client)) codes.push('wsl-detected-no-data');
+      // An object per diagnostic even though `code` is the only field today: the
+      // extension point is inside the entry, and every diagnostics format worth
+      // copying (LSP, ESLint, SARIF, RFC 9457) is shaped this way. Growing an
+      // object stays compatible; turning `string[]` into `object[]` would not.
+      // Severity is deliberately absent — it depends on which client the code
+      // lands on, which only the renderer knows.
+      if (codes.length > 0) {
+        entry.diagnostics = codes.slice(0, MAX_DIAGNOSTICS_PER_CLIENT).map((code) => ({ code }));
+      }
+    }
+    entry.overall = overall;
+    result[client] = entry;
+  }
+  const health = { version: CLIENT_HEALTH_VERSION, clients: result };
+  if (options.observedAt) health.observedAt = new Date(options.observedAt).toISOString();
+  return health;
+}
+
+// The frozen wslAnchor is only valid to merge into a preview period when it was
+// captured in the same calendar window: today only if the anchor is from today,
+// month only if from the same month. Otherwise a cross-day / cross-month full
+// scan would briefly add the previous period's WSL usage to the preview before
+// the final fresh scan corrects it. Returns the WSL period to merge, or null.
+function wslPeriodsForPreview(wslAnchor, anchorDateKey, todayKey) {
+  if (!wslAnchor) return { today: null, month: null };
+  const key = anchorDateKey || '';
+  return {
+    today: key === todayKey ? wslAnchor.today : null,
+    month: key.slice(0, 7) === todayKey.slice(0, 7) ? wslAnchor.month : null
+  };
+}
+
+function completeTodayPartitions(partitions, clientsCsv) {
+  const completed = { ...(partitions || {}) };
+  for (const client of normalizeClientsCsv(clientsCsv).split(',').filter(Boolean)) {
+    if (!Object.prototype.hasOwnProperty.call(completed, client)) completed[client] = emptyPeriod();
+  }
+  return completed;
+}
+
+function replaceTodayPartitions(current, fresh, targetClients) {
+  const next = { ...(current || {}) };
+  for (const client of targetClients || []) next[client] = emptyPeriod();
+  for (const [client, period] of Object.entries(fresh || {})) next[client] = period;
+  return next;
+}
+
+function mergeTodayPartitions(partitions) {
+  return mergePeriods(...Object.values(partitions || {}));
+}
+
+function periodHasUsage(period) {
+  if (!period) return false;
+  return Number(period.totalTokens || 0) > 0
+    || Number(period.costUsd || 0) > 0
+    || Object.keys(period.sessions || {}).length > 0;
+}
+
+function canTargetTodayPartitions(anchor, targetClients) {
+  if (!targetClients?.length) return true;
+  return Boolean(
+    anchor?.todayPartitions
+    && !periodHasUsage(anchor.todayPartitions[UNATTRIBUTED_USAGE_CLIENT])
+    && targetClients.every((client) => Object.prototype.hasOwnProperty.call(anchor.todayPartitions, client))
+  );
+}
+
+// Prices affect every scan window. Read the effective file (including entries
+// hand-authored outside the widget), and distinguish fork builds whose npm
+// version is identical. No transcript cache is changed by this fingerprint.
+function pricingFingerprint(options = {}) {
+  const pricingPath = options.pricingPath || customPricingPath({
+    env: tokscaleEnvWithBlanksDropped(process.env)
+  });
+  const hash = createHash('sha256');
+  hash.update(JSON.stringify(catalogRevision({ env: tokscaleEnvWithBlanksDropped(process.env) })));
+  hash.update(pricingPath);
+  try { hash.update(fs.readFileSync(pricingPath)); }
+  catch (error) { hash.update(`|file:${error.code || 'unreadable'}`); }
+  if (options.binaryRevision !== undefined) {
+    hash.update(`|binary:${options.binaryRevision}`);
+  } else {
+    const binary = resolvePlatformBinary();
+    hash.update(JSON.stringify([binary.source, binary.path, binary.version, readTokscaleBundledBuild()]));
+    try {
+      const stat = fs.statSync(binary.path);
+      hash.update(JSON.stringify([stat.size, stat.mtimeMs, stat.ctimeMs]));
+    } catch (_) { hash.update('|binary:missing'); }
+  }
+  return hash.digest('hex');
+}
+
+function configFingerprint(clientsCsv, allTimeSince, projectsEnabled = true, customScanPaths = null, pricingRevision = pricingFingerprint(), sourceOptions = {}, catpawRevision = catpawSourcesFingerprint(normalizeClientsCsv(clientsCsv), sourceOptions)) {
+  // Source changes invalidate the persisted anchor before any Today delta.
+  const qoderCnProjectsPart = normalizeClientsCsv(clientsCsv).split(',').includes('qodercn')
+    ? `|qodercnProjects:${clientSourceRoots('qodercn', sourceOptions).qodercn[0].dir}` : '';
+  // Custom scan paths change which files Tokscale reads, so an anchor captured
+  // before a path was added or removed must not be reused. Empty when none are
+  // configured, keeping the fingerprint (and existing anchors) stable for the
+  // common case.
+  const qoderPart = normalizeClientsCsv(clientsCsv).split(',').includes('qoder')
+    ? `|qoder:${clientSourceRoots('qoder', sourceOptions).qoder[0].dir}` : '';
+  const scanKey = customScanPathsFingerprint(customScanPaths);
+  const scanPart = scanKey ? `|scan:${scanKey}` : '';
+  const catpawPart = catpawRevision ? `|catpaw:${catpawRevision}` : '';
+  return `${normalizeClientsCsv(clientsCsv)}|${allTimeSince}|projects:${projectsEnabled !== false ? 'on' : 'off'}${qoderCnProjectsPart}${qoderPart}${scanPart}${catpawPart}|pricing:${pricingRevision}`;
+}
+
+// The one place that decides whether a persisted anchor may be reused, shared by
+// startCollector and by the widget's cold-start seed. Two consumers with two
+// copies of these rules is how they drift, and a drifted copy shows the previous
+// configuration's totals as if they were current.
+//
+// Returns null when the anchor is unusable at all. Otherwise `capturedAtMs` is
+// the moment it was written, or null when that moment cannot be trusted: the
+// collector still reuses the periods then and simply forces a full scan, while
+// a seed has nothing to stand on and declines.
+//
+// `allowEarlierDay` is for the seed alone. The collector derives month/allTime
+// by adding a fresh Today to the anchor's, which is only exact on the anchor's
+// own day. A seed is only shown until the first scan of this run replaces it,
+// so yesterday's snapshot still serves it; its periodWindows then let
+// aggregation drop the windows that have since ended.
+//
+// `allowRepricing` is the seed's too. The pricing revision covers the price
+// catalogs and the tokscale binary, which an app update always replaces, so
+// for the collector it rightly forces a rescan. The seed only needs the same
+// clients, sources and windows: the tokens it shows are last-known values, and
+// so are costs at the previous prices, until the first scan reprices them.
+function collectorAnchorTrust(saved, options = {}) {
+  const { clients = '', allTimeSince = '', projectsEnabled = true, customScanPaths = null, now = new Date() } = options;
+  if (!saved || typeof saved.dateKey !== 'string') return null;
+  const todayKey = localTodayKey(now);
+  if (saved.dateKey !== todayKey && !(options.allowEarlierDay === true && saved.dateKey < todayKey)) return null;
+  if (saved.calendarKey !== collectionCalendarKey(now)) return null;
+  if (!saved.today || !saved.month || !saved.allTime) return null;
+  // A flat provenance ledger cannot prove each period's project source.
+  if (Object.keys(saved.catalogProjects || {}).length && !saved.catalogProjects.today) return null;
+  // Old Cursor anchors preserve `default` in their broad-period model maps;
+  // applying a new `cursor-auto` Today delta to them would split one mode.
+  if (normalizeClientsCsv(clients).split(',').includes('cursor') && saved.cursorAutoModelVersion !== 1) return null;
+  const fingerprintAt = (revision) => configFingerprint(clients, allTimeSince, projectsEnabled, customScanPaths, revision, options);
+  if (saved.configFingerprint !== fingerprintAt(options.pricingRevision ?? pricingFingerprint(options))) {
+    if (options.allowRepricing !== true) return null;
+    // configFingerprint ends with the pricing revision, so everything else
+    // matches exactly when the anchor's own revision reproduces it.
+    const anchorPricing = /\|pricing:([0-9a-f]+)$/.exec(String(saved.configFingerprint || ''))?.[1];
+    if (!anchorPricing || saved.configFingerprint !== fingerprintAt(anchorPricing)) return null;
+  }
+  const parsed = Date.parse(saved.fullScanAt || '');
+  const capturedAtMs = Number.isFinite(parsed) && parsed <= now.getTime() ? parsed : null;
+  return { capturedAtMs };
+}
+
+// Force a full scan at least this often even when the anchor is otherwise
+// valid, so a long-running session periodically rescans month/allTime
+// and picks up any changes that the delta-derivation might miss.
+const FULL_SCAN_INTERVAL_MS = 60 * 60 * 1000;
+const SESSION_IDENTITY_VERSION = 2;
+
+// Ceiling on how long an unbroken run of watch events may keep deferring the
+// tick. Every event clears the pending debounce timer and re-arms a fresh one,
+// so a source that changes more often than once per `watchDebounceMs` would
+// hold the live refresh back until the interval fallback. Concurrent agents
+// streaming to their transcripts do exactly that. The re-arm itself stays — it
+// is what keeps a mid-tick event from coalescing — and 5s is the far end of
+// the promised 3-5s refresh, so the ceiling only ever fires where the promise
+// was already broken.
+const WATCH_MAX_WAIT_MS = 5000;
+
+function startCollector(options) {
+  const {
+    clients, allTimeSince, commandTimeoutMs, deviceId, agentVersion, agentRuntime,
+    historyIntervalMs = 15 * 60 * 1000, historyEnabled = true, watchEnabled,
+    watchTriggersCollection = true, intervalRequiresActivity = false,
+    onUpdate, onPreview, onError, onDiagnosticEvent, logger
+  } = options;
+  // Normalized once, at the edge. These arrive straight from CLI flags and env
+  // vars (TOKEN_MONITOR_WATCH_DEBOUNCE_MS, TOKEN_MONITOR_INTERVAL_MS) by way of
+  // a bare Number(), so Infinity and past-32-bit values reach us intact — and
+  // setTimeout rewrites those to 1ms, turning the debounce's mid-tick re-arm and
+  // the interval loop into spins. Clamping here means no timer below can
+  // reintroduce that by forgetting.
+  const watchDebounceMs = clampTimerDelayMs(options.watchDebounceMs, 1500);
+  // Floored at the debounce: a ceiling shorter than one debounce window would
+  // pull every lone event forward and make the debounce itself unobservable.
+  const watchMaxWaitMs = Math.max(watchDebounceMs, clampTimerDelayMs(options.watchMaxWaitMs, WATCH_MAX_WAIT_MS));
+  const intervalMs = clampTimerDelayMs(options.intervalMs, 5 * 60 * 1000);
+  const historyRetryMs = clampTimerDelayMs(options.historyRetryMs, 60 * 1000);
+  const watchUsePolling = resolveWatchUsePolling(options.watchUsePolling);
+  // Overridable so tests need not build a 20k-entry tree to cross it.
+  const watchPollingEntryLimit = Number.isInteger(options.watchPollingEntryLimit) && options.watchPollingEntryLimit >= 0
+    ? options.watchPollingEntryLimit
+    : WATCH_POLLING_ENTRY_LIMIT;
+  const watchNativeForced = watchPollingForbidden();
+  const runtimeAbortController = new AbortController();
+  const runtimeSignal = runtimeAbortController.signal;
+  let startBarrier = options.startBarrier ? Promise.resolve(options.startBarrier) : null;
+  let cursorRestartRead = null;
+  const trackedClients = new Set(normalizeClientsCsv(clients).split(',').filter(Boolean));
+  const reasonixNativeSessionsEnabled = options.reasonixNativeSessionsEnabled === true;
+  const reasonixNativeSessionCache = reasonixNativeSessionsEnabled && trackedClients.has('reasonix')
+    ? options.reasonixNativeSessionCache || createReasonixNativeSessionCache({
+      env: options.env || process.env,
+      homeDir: options.homeDir || os.homedir(),
+      platform: options.platform || process.platform,
+      cwdDir: options.cwdDir || process.cwd(),
+      projectIdentity
+    })
+    : null;
+  const deviceOsInfo = options.osInfo === undefined
+    ? hostOsInfo()
+    : normalizeOsInfo(options.osInfo);
+  const log = logger || (() => {});
+  const normalizedClients = normalizeClientsCsv(clients);
+  const sourceOptions = {
+    customScanPaths: options.customScanPaths,
+    env: options.env || options.sessionMetadataDeps?.env,
+    homeDir: options.homeDir,
+    platform: options.platform,
+    cwdDir: options.cwdDir
+  };
+  let tickInFlight = false;
+  let idleWaiters = [];
+  let tickPending = false;
+  let pendingForceHistory = false;
+  let pendingRolloverHistoryRetry = false;
+  let pendingForceSelfSync = null;
+  let pendingSourceSelfSync = null;
+  // null until something is actually pending. Tracked separately from the
+  // force-sync flags on purpose: a coalesced replay must stay a full scan
+  // unless *every* tick folded into it asked for today-only, and deriving that
+  // from a force flag would let a manual refresh quietly become a warm scan.
+  let pendingTodayOnly = null;
+  // null means no pending scope yet; true means an all-client replay; otherwise
+  // this Set is the union of targeted today-only requests waiting behind the
+  // active tick. A broader request can upgrade this scope but never narrow it.
+  let pendingTargetClients = null;
+  let pendingActivityRevision = null;
+  let lastHistoryAt = 0;
+  let lastHistoryAttemptAt = 0;
+  let lastHistorySuccessAt = 0;
+  let lastHistoryFailureCode = null;
+  let lastHistoryScanDurationMs = null;
+  let rolloverHistoryPending = false;
+  let rolloverHistoryRetryTimer = null;
+  // Last full-scan snapshot; lets watch ticks scan only --today and derive
+  // month/allTime exactly (applyPeriodDelta). Reset by every full tick.
+  // anchor holds Windows-only periods; wslAnchor is the WSL contribution frozen
+  // between full ticks (WSL is not scanned on watch ticks).
+  let anchor = null;
+  let wslAnchor = null;
+  let wslStatusAnchor = null;
+  // The last-activity days a history refresh produced, carried across the ticks
+  // that skip history. Read back out of the record this collector just published
+  // rather than kept as a second copy, so the two cannot drift; a restart simply
+  // relearns them from the first tick, which always includes history.
+  let activityDaysAnchor = {};
+  let codexLocalView = null;
+  let codexLocalViewDay = null;
+  let codexLocalSource = null;
+  let codexDotsVisible = options.codexDotsVisible !== false;
+  let codexVisibilityRevision = 0;
+  let publishedCodexVisibilityRevision = 0;
+  // Keep the highest complete live day in this collector even when another
+  // process owns the shared archive. A watch tick can then hand its value to a
+  // later full/history tick instead of losing it at the tick boundary.
+  let liveDailyHistoryDays = {};
+  let pricingRevision = pricingFingerprint(options);
+  let sourceRevision = catpawSourcesFingerprint(normalizedClients, sourceOptions);
+  let lastFullScanAt = 0;
+  let pendingWaiters = [];
+  let debounceTimer = null;
+  // Monotonic ms (performance.now()) by which the current run of watch events
+  // must have ticked, or 0 when no run is pending. Not Date.now(): a wall-clock
+  // step backwards mid-storm would push the deadline out by the same amount. Set by the first scheduleTick of a run, cleared when
+  // a tick actually starts so the next quiet period begins its own run.
+  let watchDeadlineAt = 0;
+  let intervalTimer = null;
+  let stopped = false;
+  let activityScheduler = null;
+  let pricingRefresher = null;
+  let activityWatchReady = false;
+  let activityUpdate = null;
+  let latestActivitySummary = null;
+  let lastTickAttemptAt = 0;
+  let lastTickSuccessAt = 0;
+  let lastTickFailureAt = 0;
+  let lastTickDurationMs = null;
+  let lastTickScope = 'full';
+  let lastTickReasonCode = null;
+  let lastTickFailureCode = null;
+  let watchFallbackCode = null;
+  let lastWatchFailureCode = null;
+  let tickHadFailure = false;
+  const scheduledWatchClients = new Set();
+  let scheduledWatchNeedsFullScan = false;
+  // Source events waiting on the shared throttle, and the timer that comes back
+  // for them. Built here rather than at module scope because its timer has to
+  // die with this collector; the throttle it reads deadlines from is shared, so
+  // a rebuild inherits the floors it must not reset. `retryMs` mirrors the watch
+  // debounce so a catch-up displaced by an in-flight tick lands just after it.
+  const sourceSyncQueue = createSourceSyncQueue({
+    throttle: selfSyncThrottle,
+    retryMs: watchDebounceMs,
+    isBusy: () => tickInFlight,
+    // The tick that carried this event already scanned against the stale cache,
+    // so the catch-up has to rescan the same clients behind the sync.
+    onDue: (sourceSelfSync) => runTick('source-sync', {
+      todayOnly: true,
+      targetClients: sourceSelfSync,
+      sourceSelfSync
+    })
+  });
+  const restoreCursorSource = kind => sourceSyncQueue.restore(['cursor'], kind);
+  const selfSyncedClients = normalizeClientsCsv(clients).split(',').filter((client) => SELF_SYNCED_CLIENTS.has(client));
+  const nonCursorSyncSelection = selection => selection === true
+    ? SELF_SYNC_KINDS.filter(client => client !== 'cursor')
+    : Array.isArray(selection) ? selection.filter(client => client !== 'cursor') : selection;
+  let publishedCursorRevision = trackedClients.has('cursor') ? -1 : 0;
+  const cursorSource = trackedClients.has('cursor') ? createCursorUsageSource({
+    signal: runtimeSignal,
+    context: { day: localTodayKey(collectionDate(options.now)), pricing: pricingRevision, calendar: collectionCalendarKey(collectionDate(options.now)) },
+    sync: (syncOptions) => maybeSyncCursor('cursor', log, {
+      ...syncOptions,
+      terminationOptions: options.subprocessTerminationOptions,
+      onTerminationUnconfirmed: () => emitDiagnosticEvent({ subsystem: 'collector', code: 'subprocess-termination-unconfirmed', operation: 'cursor-sync' })
+    }),
+    async read(context, signal) {
+      const scan = options.runTokscale || runTokscale;
+      const graph = options.runGraph || runTokscaleGraph;
+      const input = {
+        clients: 'cursor', commandTimeoutMs, signal,
+        customScanPaths: options.customScanPaths, homeDir: options.homeDir,
+        workspaces: options.projectsEnabled !== false,
+        terminationOptions: options.subprocessTerminationOptions,
+        offline: true, cursorLifecycleHeld: true,
+        timeZone: context.calendar.split('|')[0]
+      };
+      const next = {};
+      // Keep all three windows and History on one cache/account generation.
+      for (const [period, flags] of [['today', ['--today']], ['month', ['--month']], ['allTime', ['--since', allTimeSince]]]) {
+        next[period] = await scan({ ...input, flags, commandTimeoutMs: period === 'allTime' ? allTimeScanTimeoutMs(options) : commandTimeoutMs });
+        throwIfAborted(signal);
+        applyTokscaleSessionMetadata(next[period], { resolveProjects: options.projectsEnabled !== false });
+      }
+      next.graph = null;
+      if (historyEnabled) {
+        try {
+          next.graph = await graph({ ...input, commandTimeoutMs: options.historyTimeoutMs || HISTORY_TIMEOUT_MS });
+        } catch (error) {
+          throwIfAborted(signal);
+          next.graphFailed = true;
+          log(`cursor history scan failed: ${error.message}`);
+        }
+      }
+      throwIfAborted(signal);
+      // The next local tick also fences pricing changes during publication.
+      if (localTodayKey(collectionDate(options.now)) !== context.day || pricingFingerprint(options) !== context.pricing
+        || collectionCalendarKey(collectionDate(options.now)) !== context.calendar) {
+        throw new Error('Cursor snapshot inputs changed during cache scan');
+      }
+      return next;
+    },
+    onChange({ changed }) {
+      // The revision starts over with the process. The first read after a
+      // restart counts as published when it is the usage the anchor was built
+      // from, so a valid anchor keeps its Today-only tick.
+      if (publishedCursorRevision === -1 && anchor?.cursorSnapshotKey
+        && snapshotUsageKey(cursorSource.getSnapshot()) === anchor.cursorSnapshotKey) {
+        publishedCursorRevision = cursorSource.getSnapshot().revision;
+        changed = false;
+      }
+      // The restart tick waiting on this read collects it next.
+      if (cursorRestartRead) return;
+      if (!stopped) void runTick('cursor-cache', {
+        ...(changed ? { forceHistory: true } : { todayOnly: true, targetClients: ['cursor'] }),
+        cursorSnapshotRefresh: true
+      });
+    },
+    onError: error => log(`cursor cache scan failed: ${error.message}`)
+  }) : null;
+  let activityRevision = 0;
+  let collectedActivityRevision = 0;
+  let initialCollectionComplete = false;
+  const watchers = [];
+  let watchedDirectoryKey = null;
+  // A custom Codex root's watch policy depends on whether it is a Codex home
+  // yet. It becomes one when Codex first writes there, usually between hourly
+  // full scans, so successful Today ticks recheck it too and rebuild the
+  // watcher on a change; otherwise idle title lookups re-trigger collection
+  // until the next full scan.
+  let watchedCodexHomes = '';
+  const customCodexHomes = () => (trackedClients.has('codex')
+    ? (normalizeCustomScanPaths(sourceOptions.customScanPaths, { platform: sourceOptions.platform || process.platform }).codex || [])
+      .map((dir) => path.resolve(canonicalWatchPath(dir))).filter(isCodexHome)
+    : []);
+  // Sticky: once the kernel has refused us watch descriptors, every later
+  // rebuild (a client gaining or losing a data directory) stays on polling for
+  // the rest of the process. Retrying native events on each rebuild would just
+  // rediscover the same exhausted budget.
+  let watchDescriptorFallback = false;
+  // Also sticky: set when polling would have to cover more than
+  // WATCH_POLLING_ENTRY_LIMIT paths. No watcher runs from then on, and the
+  // interval loop stops waiting for watch activity, since none can arrive.
+  let watchIntervalFallback = false;
+  // Sticky as well: the watch host switched to polling on its own.
+  let watchHostPolling = false;
+
+  function emitDiagnosticEvent(event) {
+    try {
+      onDiagnosticEvent?.(event);
+    } catch (_) {
+      // Diagnostics observers must never affect collection or watcher state.
+    }
+  }
+
+  function tickReasonCode(reason) {
+    const value = String(reason || '').trim().toLowerCase();
+    if (value.startsWith('watch:')) return 'watch-event';
+    if (value.startsWith('client:')) return 'targeted-client';
+    if (value === 'source-sync') return 'source-sync';
+    if (value === 'coalesced') return 'coalesced';
+    if (value === 'interval') return 'interval';
+    if (value === 'manual') return 'manual';
+    return 'other';
+  }
+
+  function tickScopeCode(tickOptions = {}) {
+    if (tickOptions.todayOnly === true && Array.isArray(tickOptions.targetClients) && tickOptions.targetClients.length > 0) {
+      return 'targeted';
+    }
+    return tickOptions.todayOnly === true ? 'today' : 'full';
+  }
+
+  function timestampOrNull(value) {
+    return Number.isFinite(Number(value)) && Number(value) > 0
+      ? new Date(Number(value)).toISOString()
+      : null;
+  }
+
+  function cloneDiagnosticValue(value) {
+    if (value === null || value === undefined) return value ?? null;
+    try { return JSON.parse(JSON.stringify(value)); } catch (_) { return null; }
+  }
+
+  // On-disk anchor: persist full-scan snapshots so the collector can reuse
+  // month/allTime across restarts. On the first interval tick the anchor is
+  // valid for today and configFingerprint matches, only --today is scanned
+  // and month/allTime are derived via applyPeriodDelta.
+  const anchorPath = path.join(sharedDataDir(), 'collector-anchor.json');
+  if (options.anchorPersistenceEnabled !== false) {
+    try {
+      const saved = readJson(anchorPath, null);
+      const trust = collectorAnchorTrust(saved, {
+        clients,
+        allTimeSince,
+        projectsEnabled: options.projectsEnabled,
+        customScanPaths: options.customScanPaths,
+        pricingRevision,
+        ...sourceOptions
+      });
+      if (trust) {
+        anchor = {
+          dateKey: saved.dateKey,
+          calendarKey: saved.calendarKey,
+          sessionIdentityVersion: saved.sessionIdentityVersion,
+          today: saved.today,
+          month: saved.month,
+          allTime: saved.allTime,
+          t3Titles: saved.t3Titles,
+          todayT3Titles: saved.todayT3Titles,
+          catalogTitleSources: saved.catalogTitleSources,
+          catalogProjects: saved.catalogProjects,
+          ...(typeof saved.cursorSnapshotKey === 'string' ? { cursorSnapshotKey: saved.cursorSnapshotKey } : {}),
+          // Per-client partitions are deliberately rebuilt by the first
+          // anchored all-client tick after restart. Persisted partitions
+          // could be stale for clients that changed while the app was down.
+          todayPartitions: null
+        };
+        // Don't restore a persisted WSL snapshot when WSL scanning is now off —
+        // the configFingerprint intentionally ignores the toggle (host periods
+        // stay valid), so without this gate a warm-scan preview would briefly
+        // re-merge the old WSL totals before the first full tick clears them.
+        wslAnchor = options.wslScanEnabled === true ? (saved.wslBundle || null) : null;
+        wslStatusAnchor = options.wslScanEnabled === true ? (saved.wslStatus || null) : null;
+        // An untrustworthy capture time leaves lastFullScanAt at 0, which forces
+        // a full scan on the first interval tick (see loop()).
+        if (trust.capturedAtMs !== null) lastFullScanAt = trust.capturedAtMs;
+      }
+    } catch (_) {}
+  }
+
+  function persistAnchor(tickPricingRevision, tickSourceRevision) {
+    if (options.anchorPersistenceEnabled === false) return;
+    try {
+      // Bind the baseline to the scanned inputs, even if another account appears before the write.
+      fs.mkdirSync(path.dirname(anchorPath), { recursive: true });
+      fs.writeFileSync(anchorPath, JSON.stringify({
+        dateKey: anchor.dateKey,
+        calendarKey: anchor.calendarKey,
+        sessionIdentityVersion: anchor.sessionIdentityVersion,
+        cursorAutoModelVersion: 1,
+        today: anchor.today,
+        month: anchor.month,
+        allTime: anchor.allTime,
+        t3Titles: anchor.t3Titles,
+        todayT3Titles: anchor.todayT3Titles,
+        catalogTitleSources: anchor.catalogTitleSources,
+        catalogProjects: anchor.catalogProjects,
+        wslBundle: wslAnchor,
+        wslStatus: wslStatusAnchor,
+        ...(anchor.nativeSessions ? { nativeSessions: anchor.nativeSessions } : {}),
+        ...(anchor.nativeProjects ? { nativeProjects: anchor.nativeProjects } : {}),
+        ...(anchor.cursorSnapshotKey ? { cursorSnapshotKey: anchor.cursorSnapshotKey } : {}),
+        configFingerprint: configFingerprint(clients, allTimeSince, options.projectsEnabled, options.customScanPaths, tickPricingRevision, sourceOptions, tickSourceRevision),
+        fullScanAt: new Date(lastFullScanAt).toISOString()
+      }));
+    } catch (_) {}
+  }
+
+  function resolveWaiters(waiters, result) {
+    for (const resolve of waiters) resolve(result);
+  }
+
+  function clearRolloverHistoryRetry() {
+    if (rolloverHistoryRetryTimer) clearTimeout(rolloverHistoryRetryTimer);
+    rolloverHistoryRetryTimer = null;
+  }
+
+  function settleRolloverHistoryAttempt(success, retryAttempt) {
+    if (!rolloverHistoryPending) return;
+    if (success || retryAttempt) {
+      rolloverHistoryPending = false;
+      clearRolloverHistoryRetry();
+      return;
+    }
+    if (rolloverHistoryRetryTimer || stopped) return;
+    rolloverHistoryRetryTimer = setTimeout(() => {
+      rolloverHistoryRetryTimer = null;
+      if (stopped || !rolloverHistoryPending) return;
+      // One targeted retry closes a transient midnight graph failure without
+      // making every few-second watch event pay for another History scan. A
+      // second failure falls back to the normal History interval.
+      void runTick('history-rollover-retry', {
+        forceHistory: true,
+        rolloverHistoryRetry: true,
+        todayOnly: true
+      });
+    }, historyRetryMs);
+  }
+
+  const pricingChangedDuringScan = Symbol('pricing changed during scan');
+  const catpawSourcesChangedDuringScan = Symbol('CatPaw sources changed during scan');
+
+  async function performTick(reason, tickOptions = {}) {
+    const visibilityRevision = codexVisibilityRevision;
+    const tickStartedAt = Date.now();
+    const collectedAt = collectionDate(options.now);
+    const todayKey = localTodayKey(collectedAt);
+    const tickCalendarKey = collectionCalendarKey(collectedAt);
+    const timezoneChanged = Boolean(anchor && anchor.calendarKey !== tickCalendarKey);
+    const tickPricingRevision = pricingFingerprint(options);
+    const sessionMetadataFallback = anchor;
+    const pricingChanged = tickPricingRevision !== pricingRevision;
+    const tickSourceRevision = catpawSourcesFingerprint(normalizedClients, sourceOptions);
+    const catpawSourcesChanged = tickSourceRevision !== sourceRevision;
+    if (pricingChanged || catpawSourcesChanged || timezoneChanged) {
+      anchor = null;
+      wslAnchor = null;
+      wslStatusAnchor = null;
+      liveDailyHistoryDays = {};
+      lastFullScanAt = 0;
+      lastHistoryAt = 0;
+      pricingRevision = tickPricingRevision;
+      sourceRevision = tickSourceRevision;
+    }
+    // The previous live DAY becomes durable history at local midnight. Finalize
+    // it before publishing the new day, even when the normal History interval
+    // is not due yet, so fixed ranges never wait for the next scheduled graph.
+    const localDayRolledOver = Boolean(anchor?.dateKey && anchor.dateKey !== todayKey);
+    if (localDayRolledOver && historyEnabled) rolloverHistoryPending = true;
+    let includeHistory = shouldIncludeHistory(
+      collectedAt.getTime(),
+      lastHistoryAt,
+      historyIntervalMs,
+      Boolean(tickOptions.forceHistory) || localDayRolledOver || pricingChanged || catpawSourcesChanged || timezoneChanged,
+      historyEnabled
+    );
+    if (includeHistory) {
+      lastHistoryAt = collectedAt.getTime();
+      lastHistoryAttemptAt = tickStartedAt;
+    }
+    let historyScanSucceeded = !includeHistory;
+    const requestedTargetClients = [...new Set(normalizeClientsCsv(tickOptions.targetClients).split(',').filter(Boolean))];
+    const targetAnchorReady = canTargetTodayPartitions(anchor, requestedTargetClients);
+    let anchored = Boolean(tickOptions.todayOnly && anchor && anchor.dateKey === todayKey);
+    const refreshWsl = Boolean(tickOptions.refreshWsl);
+    const hadPreviousFailure = tickHadFailure;
+    lastTickAttemptAt = tickStartedAt;
+    lastTickReasonCode = tickReasonCode(reason);
+    lastTickScope = tickScopeCode(tickOptions);
+    try {
+      // Coalesced ticks and pricing replays also enter here directly. Fence
+      // every scan, not just the initiating runTick, against an older snapshot.
+      const cursorContext = { day: todayKey, pricing: tickPricingRevision, calendar: tickCalendarKey };
+      if (cursorSource && !cursorSource.contextMatches(cursorContext)) await cursorSource.ensureContext(cursorContext);
+      const tickCursorSnapshot = cursorSource?.getSnapshot();
+      if (tickCursorSnapshot && tickCursorSnapshot.revision !== publishedCursorRevision) {
+        anchored = false;
+        includeHistory = historyEnabled;
+        historyScanSucceeded = !includeHistory;
+        if (includeHistory) {
+          lastHistoryAt = collectedAt.getTime();
+          lastHistoryAttemptAt = tickStartedAt;
+        }
+      }
+      let captured = null;
+      let tickLocalView = null;
+      let catpawSourceChangeObserved = false;
+      const summary = await collectUsageOnce({
+        ...options,
+        ...(tickCursorSnapshot ? { cursorSnapshot: tickCursorSnapshot } : {}),
+        offlinePricing: true,
+        codexDotsVisible,
+        signal: runtimeSignal,
+        clients,
+        allTimeSince,
+        commandTimeoutMs,
+        deviceId,
+        agentVersion,
+        agentRuntime,
+        osInfo: deviceOsInfo,
+        now: collectedAt,
+        expectedCalendarKey: tickCalendarKey,
+        includeHistory,
+        pricingRevision: tickPricingRevision,
+        customPricingActive: Object.keys(readJson(options.pricingPath || customPricingPath({ env: tokscaleEnvWithBlanksDropped(process.env) }), {})?.models || {}).length > 0,
+        // Capture after the runtime's transformUsage hook so the archive uses
+        // the same today period that the user actually sees. The process-local
+        // liveDays overlay is passed into any graph scan that happens first.
+        deferLiveHistoryCapture: true,
+        dailyHistoryLiveDays: liveDailyHistoryDays,
+        onHistoryStatus: includeHistory ? (status) => {
+          lastHistoryAttemptAt = Date.parse(status.attemptedAt) || lastHistoryAttemptAt;
+          const successAt = Date.parse(status.successAt);
+          if (Number.isFinite(successAt)) lastHistorySuccessAt = successAt;
+          lastHistoryFailureCode = status.failureCode || null;
+          lastHistoryScanDurationMs = status.durationMs;
+          historyScanSucceeded = Boolean(status.successAt && !status.failureCode);
+        } : null,
+        forceSelfSync: tickOptions.forceSelfSync ?? null,
+        sourceSelfSync: tickOptions.sourceSelfSync ?? null,
+        reasonixNativeSessionsEnabled,
+        reasonixNativeSessionCache,
+        codexLocalUsageStore: codexLocalSource?.store || options.codexLocalUsageStore,
+        onCodexLocalUsageComputed: (view) => {
+          if (visibilityRevision !== codexVisibilityRevision) return;
+          codexLocalView = view;
+          codexLocalViewDay = todayKey;
+          tickLocalView = view;
+        },
+        // Both selections name clients whose pending source event this tick has
+        // already consumed — the queue's drain for one, its acknowledgement for
+        // the other — so either is a legitimate restore.
+        onSelfSyncFailed: (kind) => sourceSyncQueue.restore(
+          mergeSelfSyncSelection(tickOptions.sourceSelfSync, tickOptions.acknowledgedSourceSync) || [],
+          kind
+        ),
+        targetClients: anchored && targetAnchorReady ? requestedTargetClients : [],
+        sessionMetadataFallback,
+        todayOnlyAnchor: anchored ? anchor : null,
+        wslAnchor: anchored ? wslAnchor : null,
+        wslStatus: anchored ? wslStatusAnchor : null,
+        lastActivityDays: activityDaysAnchor,
+        refreshWsl: anchored ? refreshWsl : false,
+        onAnchorComputed: (x) => { captured = x; },
+        onProgress: (partial) => {
+          if (catpawSourcesFingerprint(normalizedClients, sourceOptions) !== tickSourceRevision) catpawSourceChangeObserved = true;
+          if (visibilityRevision !== codexVisibilityRevision) return;
+          if (visibilityRevision !== publishedCodexVisibilityRevision) return;
+          if (!partial.today) return;
+          if (pricingChanged || pricingFingerprint(options) !== tickPricingRevision
+              || catpawSourcesChanged || catpawSourceChangeObserved) return;
+          try {
+            if (typeof onPreview === 'function') {
+              // Frozen WSL snapshot, gated so a cross-day/cross-month full scan
+              // doesn't merge a stale period's WSL usage into the preview.
+              const wsl = wslPeriodsForPreview(wslAnchor, anchor?.dateKey, todayKey);
+              const preview = {
+                deviceId, hostname: os.hostname(),
+                deviceKind: hostDeviceKind(),
+                platform: `${process.platform}-${process.arch}`,
+                ...(deviceOsInfo.name ? { osName: deviceOsInfo.name } : {}),
+                ...(deviceOsInfo.version ? { osVersion: deviceOsInfo.version } : {}),
+                updatedAt: partial.updatedAt,
+                // The scan's own windows, fixed at its start, so a scan that runs
+                // past midnight still reports the day it collected. DeviceState
+                // applies them only to the periods this preview carries.
+                ...(partial.periodWindows ? { periodWindows: partial.periodWindows } : {}),
+                agentVersion, agentRuntime,
+                trackedClients: (clients || '').split(',').filter(Boolean),
+                // Merge the frozen WSL snapshot into today (as month/allTime do
+                // below) so the today card keeps its WSL contribution during a
+                // warm scan instead of dropping to host-only until the final tick.
+                // The upstream wsl.today guard is preserved: non-WSL machines
+                // keep the identity pass-through instead of a normalize round
+                // trip on this shared preview path.
+                today: wsl.today ? mergePeriods(partial.today, wsl.today) : partial.today
+              };
+              // Only include month/allTime when actually scanned. During warm
+              // full scans the main.js handler carries the previous values
+              // forward for omitted fields, so these cards don't flash empty.
+              if (partial.month) {
+                preview.month = wsl.month
+                  ? mergePeriods(partial.month, wsl.month)
+                  : partial.month;
+              }
+              if (partial.allTime) {
+                preview.allTime = wslAnchor
+                  ? mergePeriods(partial.allTime, wslAnchor.allTime)
+                  : partial.allTime;
+              }
+              // Only derive clientStatus when allTime is available; warm
+              // scans carry the previous status forward in main.js.
+              if (partial.allTime) {
+                preview.clientStatus = deriveClientStatus(clients, partial.allTime);
+              }
+              if (codexLocalView && codexLocalViewDay === todayKey) {
+                for (const name of ['today', 'month', 'allTime']) {
+                  if (preview[name]) preview[name] = mergePeriods(preview[name], codexLocalView[name]);
+                }
+                preview.codexLocalSessionKeys = codexLocalView.sessionKeys;
+              }
+              onPreview(preview);
+            }
+          } catch (_) {
+            // Progressive push errors must not abort the remaining period scans.
+            // The final onUpdate will report the complete data.
+          }
+        }
+      });
+      if (stopped) return;
+      // A visibility change queues a fresh projection, but must neither stop
+      // the observer nor publish an in-flight result under the old selection.
+      if (visibilityRevision !== codexVisibilityRevision) return false;
+      if (includeHistory && !summary.history
+        && (!codexDotsVisible || visibilityRevision !== publishedCodexVisibilityRevision)) {
+        // An empty successful graph normally omits history so DeviceState can
+        // keep its last snapshot. A visibility change must replace that old
+        // projection, including when all its history was Dots-only. A newly
+        // created hidden collector must do the same after replacement/fallback:
+        // its local revision starts at zero, but DeviceState keeps old history.
+        summary.history = historyScanSucceeded ? normalizeHistory([], { todayKey }) : null;
+      }
+      if (catpawSourceChangeObserved
+          || catpawSourcesFingerprint(normalizedClients, sourceOptions) !== tickSourceRevision) {
+        return catpawSourcesChangedDuringScan;
+      }
+      // A settings save can land between the serial period scans. Discard that
+      // mixed result and replay all windows against one pricing revision.
+      if (pricingFingerprint(options) !== tickPricingRevision) {
+        return pricingChangedDuringScan;
+      }
+      if (includeHistory) {
+        settleRolloverHistoryAttempt(
+          historyScanSucceeded,
+          tickOptions.rolloverHistoryRetry === true
+        );
+      }
+      for (const [client, entry] of Object.entries(summary.clientHealth?.clients || {})) {
+        if (entry.data?.lastActivityDay) activityDaysAnchor[client] = entry.data.lastActivityDay;
+      }
+      if (!anchored && captured) {
+        const cursorSnapshotKey = snapshotUsageKey(tickCursorSnapshot);
+        anchor = {
+          dateKey: todayKey,
+          calendarKey: tickCalendarKey,
+          sessionIdentityVersion: captured.sessionIdentityVersion,
+          today: captured.windowsPeriods.today,
+          month: captured.windowsPeriods.month,
+          allTime: captured.windowsPeriods.allTime,
+          todayPartitions: captured.todayPartitions,
+          t3Titles: captured.t3Titles,
+          todayT3Titles: captured.t3Titles,
+          catalogTitleSources: captured.catalogTitleSources,
+          catalogProjects: captured.catalogProjects,
+          ...(captured.nativeSessions ? { nativeSessions: captured.nativeSessions } : {}),
+          ...(captured.nativeProjects ? { nativeProjects: captured.nativeProjects } : {}),
+          ...(cursorSnapshotKey ? { cursorSnapshotKey } : {})
+        };
+        wslAnchor = captured.wslBundle;
+        wslStatusAnchor = captured.wslStatus || null;
+        lastFullScanAt = Date.now();
+        persistAnchor(tickPricingRevision, tickSourceRevision);
+      } else if (anchored && captured) {
+        const identitiesUpgraded = anchor.sessionIdentityVersion !== captured.sessionIdentityVersion;
+        if (identitiesUpgraded) {
+          for (const period of ['today', 'month', 'allTime']) {
+            for (const [key, session] of Object.entries(anchor[period]?.sessions || {})) {
+              const resolved = captured.windowsPeriods[period]?.sessions?.[key];
+              for (const field of ['nativeSessionId', 't3ThreadId']) {
+                if (resolved?.[field]) session[field] = resolved[field];
+              }
+              // Commit the confirmed link with its namespace before advancing
+              // the migration version; later watch ticks do not revisit history.
+              if (resolved?.parentSessionId) {
+                session.parentSessionId = resolved.parentSessionId;
+                if (resolved.parentClient && resolved.parentClient !== session.client) session.parentClient = resolved.parentClient;
+                else delete session.parentClient;
+              }
+            }
+          }
+          anchor.sessionIdentityVersion = captured.sessionIdentityVersion;
+        }
+        // Keep the rolling per-client today partitions fresh for targeted
+        // watch ticks. WSL stays independently frozen between interval ticks.
+        if (captured.todayPartitions) anchor.todayPartitions = captured.todayPartitions;
+        const titlesChanged = JSON.stringify(anchor.todayT3Titles || anchor.t3Titles || {}) !== JSON.stringify(captured.t3Titles);
+        const projectsChanged = JSON.stringify(anchor.catalogProjects || {}) !== JSON.stringify(captured.catalogProjects || {});
+        const sourcesChanged = JSON.stringify(anchor.catalogTitleSources || {}) !== JSON.stringify(captured.catalogTitleSources || {});
+        anchor.catalogTitleSources = captured.catalogTitleSources;
+        if (projectsChanged) {
+          for (const [key, session] of Object.entries(summary.today.sessions || {})) {
+            for (const period of ['today', 'month', 'allTime']) {
+              const target = anchor[period]?.sessions?.[key];
+              if (target && (!target.projectId || (anchor.catalogProjects?.[period]?.[key] && target.projectId === anchor.catalogProjects[period][key]))) {
+                if (session.projectId) {
+                  target.projectId = summary[period]?.sessions?.[key]?.projectId;
+                  target.projectLabel = summary[period]?.sessions?.[key]?.projectLabel;
+                } else if (!captured.catalogProjects?.[period]?.[key]) {
+                  delete target.projectId;
+                  delete target.projectLabel;
+                }
+              }
+            }
+          }
+          anchor.catalogProjects = captured.catalogProjects;
+        }
+        if (titlesChanged) {
+          // Only labels move: the exact usage baseline and full-scan time stay
+          // frozen. This also keeps cold-start previews at the latest title.
+          for (const [key, title] of Object.entries(captured.t3Titles || {})) {
+            for (const period of ['today', 'month', 'allTime']) {
+              const session = anchor[period]?.sessions?.[key];
+              if (!session) continue;
+              if (title) session.title = title;
+              else if (session.title === anchor.t3Titles?.[key]) {
+                const fallback = summary[period]?.sessions?.[key]?.title;
+                if (fallback) session.title = fallback;
+                else delete session.title;
+              }
+            }
+          }
+          anchor.t3Titles = captured.t3Titles;
+        }
+        anchor.todayT3Titles = captured.t3Titles;
+        if (captured.nativeSessions) anchor.nativeSessions = captured.nativeSessions;
+        if (captured.nativeProjects) anchor.nativeProjects = captured.nativeProjects;
+        if (refreshWsl) {
+          wslAnchor = captured.wslBundle;
+          wslStatusAnchor = captured.wslStatus || null;
+        }
+        if (titlesChanged || projectsChanged || sourcesChanged || identitiesUpgraded) persistAnchor(tickPricingRevision, tickSourceRevision);
+      }
+      const transformedSummary = await onUpdate?.(summary, reason);
+      if (tickCursorSnapshot) publishedCursorRevision = tickCursorSnapshot.revision;
+      publishedCodexVisibilityRevision = visibilityRevision;
+      const visibleSummary = transformedSummary && typeof transformedSummary === 'object'
+        ? transformedSummary
+        : summary;
+      // Use the actual visible baseline whether archive projection mutated the
+      // input or returned a copy. Retained identities suppress temporary rows.
+      require('./sessionActivityProjection').invalidateActivityIndex(visibleSummary);
+      latestActivitySummary = visibleSummary;
+      if (historyEnabled !== false && options.dailyHistoryArchiveEnabled) {
+        try {
+          // The scanner window owns the date, even if the OS timezone changes
+          // while the runtime awaits its archive/presentation transform.
+          const visibleDateKey = summary.periodWindows.today.key;
+          const retainedToday = tickLocalView?.sessionKeys?.length
+            ? applyPeriodDelta(visibleSummary.today, emptyPeriod(), tickLocalView.today)
+            : visibleSummary.today;
+          const retainedLive = retainLiveDailyHistory(retainedToday, {
+            ...(options.dailyHistoryArchiveOptions || {}),
+            liveDays: liveDailyHistoryDays,
+            timeZone: summary.periodWindows.timeZone,
+            todayKey: visibleDateKey,
+            pricingRevision: tickPricingRevision,
+            // Watch ticks update the in-memory maximum on every refresh, but
+            // only full/history ticks write it. This avoids a disk write for
+            // every few-second watch event without dropping the value before
+            // the next tick or local-day rollover.
+            writeEnabled: !anchored || includeHistory
+              || anchor?.dateKey !== visibleDateKey
+              ? options.dailyHistoryArchiveWriteEnabled
+              : false
+          });
+          liveDailyHistoryDays = (retainedLive.calendars?.[summary.periodWindows.timeZone] || retainedLive).liveDays || {};
+        } catch (error) {
+          log(`daily live history archive failed: ${error.message}`);
+        }
+      }
+      const tickFinishedAt = Date.now();
+      lastTickSuccessAt = tickFinishedAt;
+      lastTickDurationMs = Math.max(0, tickFinishedAt - tickStartedAt);
+      lastTickFailureCode = null;
+      tickHadFailure = false;
+      if (hadPreviousFailure) {
+        emitDiagnosticEvent({
+          subsystem: 'collector',
+          code: 'collector-recovered',
+          durationMs: lastTickDurationMs
+        });
+      }
+      // A newly written Senpi header can expose a different project's child
+      // tree during an anchored Today tick, before the fallback interval.
+      if (!anchored || trackedClients.has('senpi') || JSON.stringify(customCodexHomes()) !== watchedCodexHomes) setupWatchers();
+      if (Number.isFinite(tickOptions.activityRevision)) {
+        collectedActivityRevision = Math.max(collectedActivityRevision, tickOptions.activityRevision);
+        initialCollectionComplete = true;
+      }
+      return true;
+    } catch (error) {
+      if (stopped) return;
+      if (includeHistory) {
+        settleRolloverHistoryAttempt(false, tickOptions.rolloverHistoryRetry === true);
+      }
+      const tickFinishedAt = Date.now();
+      lastTickFailureAt = tickFinishedAt;
+      lastTickDurationMs = Math.max(0, tickFinishedAt - tickStartedAt);
+      lastTickFailureCode = 'tick-failed';
+      tickHadFailure = true;
+      emitDiagnosticEvent({
+        subsystem: 'collector',
+        code: 'collector-tick-failed',
+        scope: lastTickScope,
+        durationMs: lastTickDurationMs
+      });
+      // takeWatchClients() already drained the pending set, so the clients this
+      // tick was meant to cover are gone. Force the next tick to scan all of
+      // them in every mode: in live mode the next watch event would otherwise
+      // target only its own client and leave the failed one serving the stale
+      // anchor partition until the 5–30 minute interval reconciles it, which
+      // breaks the seconds-level freshness live mode promises.
+      scheduledWatchNeedsFullScan = true;
+      if (onError) onError(error, reason); else log(`collector tick failed (${reason}): ${error.message}`);
+      return false;
+    }
+  }
+
+  function mergePendingTargetScope(tickOptions) {
+    const todayOnly = tickOptions.todayOnly === true;
+    const targets = [...new Set(normalizeClientsCsv(tickOptions.targetClients).split(',').filter(Boolean))];
+    if (!todayOnly || targets.length === 0) {
+      pendingTargetClients = true;
+      return;
+    }
+    if (pendingTargetClients === true) return;
+    if (!(pendingTargetClients instanceof Set)) pendingTargetClients = new Set();
+    for (const client of targets) pendingTargetClients.add(client);
+  }
+
+  async function runTick(reason, tickOptions = {}) {
+    // Metadata-only publications share the same output lane as token scans.
+    if (activityUpdate) await activityUpdate;
+    if (stopped || runtimeSignal.aborted) return false;
+    if (startBarrier) {
+      const barrier = startBarrier;
+      try {
+        await barrier;
+      } finally {
+        if (startBarrier === barrier) startBarrier = null;
+      }
+      if (stopped || runtimeSignal.aborted) return false;
+    }
+    if (cursorSource) {
+      const context = { day: localTodayKey(collectionDate(options.now)), pricing: pricingFingerprint(options), calendar: collectionCalendarKey(collectionDate(options.now)) };
+      try {
+        // Context/explicit waits are outside tickInFlight. Other tools keep
+        // collecting while a requested Cursor refresh owns its separate lane.
+        if (!cursorSource.contextMatches(context)) await cursorSource.ensureContext(context);
+        // After a restart the anchor may already hold the cached Cursor usage.
+        // Read the cache once before deciding the scope; onChange adopts a
+        // match. Gate on the snapshot, not on publication: every completed
+        // read schedules a tick, so a failed reconcile would otherwise loop.
+        if (publishedCursorRevision === -1 && anchor?.cursorSnapshotKey
+          && cursorSource.getSnapshot().revision === 0) {
+          // whenIdle() waits on this read: the tick has not entered tickInFlight yet.
+          const read = cursorSource.readCache(context).catch(() => {});
+          cursorRestartRead = read;
+          try { await read; } finally { if (cursorRestartRead === read) cursorRestartRead = null; }
+        }
+        const targets = normalizeClientsCsv(tickOptions.targetClients).split(',').filter(Boolean);
+        const cursorSelected = !tickOptions.todayOnly || targets.length === 0 || targets.includes('cursor')
+          || selfSyncSelected(tickOptions.forceSelfSync, 'cursor') || selfSyncSelected(tickOptions.sourceSelfSync, 'cursor');
+        if (!tickOptions.cursorSnapshotRefresh && cursorSelected) {
+          const cursorAcknowledged = selfSyncSelected(tickOptions.forceSelfSync, 'cursor')
+            ? sourceSyncQueue.acknowledge(['cursor']) : [];
+          tickOptions = { ...tickOptions, acknowledgedSourceSync: mergeSelfSyncSelection(tickOptions.acknowledgedSourceSync, cursorAcknowledged) };
+          const consumed = mergeSelfSyncSelection(tickOptions.sourceSelfSync, tickOptions.acknowledgedSourceSync) || [];
+          const refresh = cursorSource.refresh({
+            context,
+            force: selfSyncSelected(tickOptions.forceSelfSync, 'cursor'),
+            source: selfSyncSelected(tickOptions.sourceSelfSync, 'cursor'),
+            minIntervalMs: () => selfSyncThrottle.minIntervalForTick(tickOptions, 'cursor'),
+            timeoutMs: options.selfSyncTimeoutMs,
+            ...(selfSyncSelected(consumed, 'cursor') ? { onFailure: restoreCursorSource } : {})
+          });
+          if (selfSyncSelected(tickOptions.forceSelfSync, 'cursor') && await refresh === false) return false;
+        }
+      } catch (error) {
+        if (stopped) return false;
+        if (onError) onError(error, reason); else log(`collector Cursor refresh failed: ${error.message}`);
+        return false;
+      }
+      if (stopped) return false;
+      if (cursorSource.getSnapshot().revision !== publishedCursorRevision) {
+        tickOptions = { ...tickOptions, todayOnly: false, targetClients: [], forceHistory: true };
+      }
+    }
+    const tickActivityRevision = Number.isFinite(tickOptions.activityRevision)
+      ? tickOptions.activityRevision
+      : activityRevision;
+    const effectiveTickOptions = { ...tickOptions, activityRevision: tickActivityRevision };
+    if (tickInFlight) {
+      tickPending = true;
+      pendingForceHistory = pendingForceHistory || Boolean(tickOptions.forceHistory);
+      pendingRolloverHistoryRetry = pendingRolloverHistoryRetry
+        || Boolean(tickOptions.rolloverHistoryRetry);
+      pendingForceSelfSync = mergeSelfSyncSelection(pendingForceSelfSync, tickOptions.forceSelfSync);
+      pendingSourceSelfSync = mergeSelfSyncSelection(pendingSourceSelfSync, tickOptions.sourceSelfSync);
+      pendingTodayOnly = pendingTodayOnly === null
+        ? Boolean(tickOptions.todayOnly)
+        : pendingTodayOnly && Boolean(tickOptions.todayOnly);
+      mergePendingTargetScope(tickOptions);
+      pendingActivityRevision = pendingActivityRevision === null
+        ? tickActivityRevision
+        : Math.max(pendingActivityRevision, tickActivityRevision);
+      return new Promise((resolve) => pendingWaiters.push(resolve));
+    }
+    tickInFlight = true;
+    let inputReplayUsed = false;
+    const performWithInputReplay = async (tickReason, scanOptions) => {
+      const result = await performTick(tickReason, scanOptions);
+      if ((result !== pricingChangedDuringScan && result !== catpawSourcesChangedDuringScan) || inputReplayUsed || stopped) return result;
+      inputReplayUsed = true;
+      // At most one automatic replay belongs to this initiating tick, including
+      // its coalesced work. A second mismatch waits for a normal tick; neither
+      // mixed result is published. Already acknowledged source sync stays consumed.
+      return performTick(result === pricingChangedDuringScan ? 'pricing-change' : 'catpaw-source-change', {
+        ...scanOptions,
+        forceHistory: true,
+        todayOnly: false,
+        targetClients: [],
+        forceSelfSync: null,
+        sourceSelfSync: null,
+        acknowledgedSourceSync: null
+      });
+    };
+    try {
+      const initialResult = await performWithInputReplay(reason, {
+        ...effectiveTickOptions,
+        acknowledgedSourceSync: mergeSelfSyncSelection(effectiveTickOptions.acknowledgedSourceSync,
+          sourceSyncQueue.acknowledge(cursorSource ? nonCursorSyncSelection(effectiveTickOptions.forceSelfSync) : effectiveTickOptions.forceSelfSync))
+      });
+      while (tickPending && !stopped) {
+        const forceHistory = pendingForceHistory;
+        const rolloverHistoryRetry = pendingRolloverHistoryRetry;
+        const forceSelfSync = pendingForceSelfSync;
+        const sourceSelfSync = pendingSourceSelfSync;
+        const todayOnly = pendingTodayOnly === true;
+        const targetClients = todayOnly && pendingTargetClients instanceof Set
+          ? [...pendingTargetClients]
+          : [];
+        const activityRevision = pendingActivityRevision;
+        const waiters = pendingWaiters;
+        pendingWaiters = [];
+        tickPending = false;
+        pendingForceHistory = false;
+        pendingRolloverHistoryRetry = false;
+        pendingForceSelfSync = null;
+        pendingSourceSelfSync = null;
+        pendingTodayOnly = null;
+        pendingTargetClients = null;
+        pendingActivityRevision = null;
+        const acknowledgedSourceSync = sourceSyncQueue.acknowledge(cursorSource ? nonCursorSyncSelection(forceSelfSync) : forceSelfSync);
+        const result = await performWithInputReplay('coalesced', {
+          forceHistory,
+          rolloverHistoryRetry,
+          forceSelfSync,
+          sourceSelfSync,
+          acknowledgedSourceSync,
+          todayOnly,
+          targetClients,
+          ...(activityRevision === null ? {} : { activityRevision })
+        });
+        resolveWaiters(waiters, result === true);
+      }
+      return initialResult === true;
+    } finally {
+      tickInFlight = false;
+      if (idleWaiters.length > 0) {
+        const waiters = idleWaiters;
+        idleWaiters = [];
+        resolveWaiters(waiters, true);
+      }
+      if (stopped && pendingWaiters.length > 0) {
+        const waiters = pendingWaiters;
+        pendingWaiters = [];
+        resolveWaiters(waiters, false);
+      }
+    }
+  }
+
+  function recordWatchClients(eventClients) {
+    if (Array.isArray(eventClients)) {
+      if (eventClients.length === 0) scheduledWatchNeedsFullScan = true;
+      else for (const client of eventClients) scheduledWatchClients.add(client);
+    }
+  }
+
+  function takeWatchClients(additionalClients = []) {
+    const targetClients = scheduledWatchNeedsFullScan
+      ? []
+      : [...new Set([...scheduledWatchClients, ...additionalClients])];
+    scheduledWatchClients.clear();
+    scheduledWatchNeedsFullScan = false;
+    return targetClients;
+  }
+
+  function scheduleTick(reason, eventClients) {
+    if (stopped) return;
+    recordWatchClients(eventClients);
+    // The first event of a run pins the deadline; every re-arm after it waits
+    // out whichever of the debounce and the remaining ceiling comes first, so a
+    // storm faster than the debounce still ticks instead of deferring forever.
+    // Time behind an in-flight tick does not count toward the ceiling: the timer
+    // can only re-arm there, and a slow tick under a steady write stream would
+    // otherwise chain scans back-to-back once it finished. Floored at 1ms
+    // because clampTimerDelayMs' reason applies here too: a zero or negative
+    // delay is rewritten to 1ms by setTimeout, and an expired deadline must arm
+    // a real timer rather than spin.
+    const nowMs = performance.now();
+    if (tickInFlight) watchDeadlineAt = 0;
+    else if (watchDeadlineAt === 0) watchDeadlineAt = nowMs + watchMaxWaitMs;
+    const delayMs = watchDeadlineAt === 0
+      ? watchDebounceMs
+      : Math.max(1, Math.min(watchDebounceMs, watchDeadlineAt - nowMs));
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      // Re-arm instead of queueing onto the in-flight tick: the coalesce path
+      // would re-run immediately on completion, stacking scans back-to-back.
+      // There is deliberately no cooldown on top of the debounce: the product
+      // promises 3–5 s updates, and a cooldown would break that promise.
+      if (tickInFlight) { scheduleTick(reason); return; }
+      watchDeadlineAt = 0;
+      // A raw source event means that client's synced cache may now be stale, so
+      // its sync drops to the short floor instead of waiting out the idle
+      // cadence. Its cache is deliberately outside the watcher, so a sync here
+      // cannot create the issue #15 self-trigger loop.
+      runTick(reason, {
+        todayOnly: true,
+        targetClients: takeWatchClients(),
+        sourceSelfSync: sourceSyncQueue.takeDue()
+      });
+    }, delayMs);
+  }
+
+  // chokidar's close() walks every watched entry and closes every fs.watch
+  // handle inline, and its cost grows superlinearly with that count, so on a
+  // tree the size of ~/.claude/projects it runs for about a second. That cost
+  // has not gone away — watcherHost.js just decides who pays it, and by
+  // default that is a child process rather than the thread driving the UI. `skipClose`
+  // is the quit path: descriptors go with the process, so there is nothing to
+  // wait for.
+  function closeWatchers({ skipClose = false } = {}) {
+    activityWatchReady = false;
+    for (const host of watchers) {
+      try { host.close({ skipClose }); } catch (_) {}
+    }
+    watchers.length = 0;
+  }
+
+  function enterIntervalFallback(error) {
+    if (watchIntervalFallback) return;
+    watchIntervalFallback = true;
+    emitDiagnosticEvent({
+      subsystem: 'watcher',
+      code: 'watcher-interval-fallback',
+      ...(watchFallbackCode ? { detailCode: watchFallbackCode } : {})
+    });
+    log(`Cannot watch safely (${error.message}); collecting every ${Math.round(intervalMs / 1000)}s instead.`);
+    // Reported from inside the host's own dispatch, so the teardown waits a turn.
+    setImmediate(() => {
+      if (!stopped) closeWatchers();
+    });
+  }
+
+  function handleWatchError(error) {
+    activityWatchReady = false;
+    activityScheduler?.request();
+    log(`chokidar error: ${error.message}`);
+    if (stopped) return;
+    if (WATCH_REFUSAL_CODES.has(error?.code)) {
+      enterIntervalFallback(error);
+      return;
+    }
+    if (stopped || watchUsePolling || watchNativeForced || watchDescriptorFallback || watchIntervalFallback) return;
+    if (!WATCH_DESCRIPTOR_ERROR_CODES.has(error?.code)) return;
+    watchDescriptorFallback = true;
+    watchFallbackCode = error.code;
+    emitDiagnosticEvent({
+      subsystem: 'watcher',
+      code: 'watcher-polling-fallback',
+      detailCode: error.code
+    });
+    log(`Native file events unavailable (${error.code}); falling back to 2s polling.`);
+    // Rebuilding from inside chokidar's own error emit would close the watcher
+    // mid-dispatch, so hand it to the next tick of the loop instead.
+    setImmediate(() => {
+      if (stopped) return;
+      watchedDirectoryKey = null;
+      setupWatchers();
+    });
+  }
+
+  function setupWatchers() {
+    if (!watchEnabled || watchIntervalFallback) return;
+    const watchOptions = {
+      ...sourceOptions,
+      codexHomes: customCodexHomes(),
+      ...(trackedClients.has('senpi') ? { senpiSources: senpiWatchSources(sourceOptions) } : {})
+    };
+    // Canonicalise before anything derives from these roots, so the paths handed
+    // to chokidar and the paths clientsForWatchPath matches against are the same
+    // strings. Resolving only one of the two would silently break attribution.
+    // One dirExists sweep feeds both maps: probing twice would let a directory
+    // created between the sweeps land in the watch list and not the attribution
+    // list, or the reverse.
+    const watchRoots = watchClientRootsForClients(clients, watchOptions);
+    const rootsByClient = Object.fromEntries(
+      Object.entries(watchRoots)
+        .map(([client, dirs]) => [client, dirs.map(canonicalWatchPath)])
+    );
+    const copilotExporter = rootsByClient.copilot ? copilotExporterWatch(os.homedir()) : null;
+    const attributionOptions = { ...watchOptions, copilotExporter };
+    // Watch targets and attribution prefixes are the same list everywhere except
+    // a custom Copilot exporter, whose parent must be watched without becoming a
+    // copilot prefix. Canonicalised through the same function so both still
+    // compare equal to the paths chokidar reports.
+    const attributionRootsByClient = Object.fromEntries(
+      Object.entries(watchAttributionRootsForClients(clients, watchRoots, attributionOptions))
+        .map(([client, dirs]) => [client, dirs.map(canonicalWatchPath)])
+    );
+    // The shared watcher keeps the union of overlapping sources. An event
+    // retained for one client must not collect or self-sync another client
+    // whose own source policy rejects it.
+    const attributionIgnores = Object.fromEntries(Object.keys(rootsByClient)
+      .map(client => [client, watchIgnoreMatcher(client, attributionOptions)]));
+    // A subset of the same roots, matched separately so a write to a client's
+    // parse-local data cannot pass for a write to its self-sync source.
+    const sourceSyncRootsByClient = Object.fromEntries(
+      Object.entries(selfSyncSourceRootsForClients(clients, sourceOptions))
+        .map(([client, dirs]) => [client, dirs.map(canonicalWatchPath)])
+    );
+    const summaryFiles = new Set(antigravitySummaryWatchSources(sourceOptions)
+      .flatMap(({ file }) => [file, `${file}-wal`]));
+    const usageDirs = [...new Set(Object.values(rootsByClient).flat())];
+    const activitySources = options.sessionActivityPolling === false ? [] : activityWatchSources(trackedClients, {
+      ...options.sessionMetadataDeps, ...sourceOptions, homeDir: options.homeDir || os.homedir()
+    }).map((source) => ({ ...source, dir: canonicalWatchPath(source.dir),
+      target: path.resolve(canonicalWatchPath(source.dir), path.relative(source.dir, source.target)),
+      ...(source.runtimeFile ? { runtimeFile: path.resolve(canonicalWatchPath(source.dir), path.relative(source.dir, source.runtimeFile)) } : {}) }));
+    const dirs = [...new Set([...usageDirs, ...activitySources.map((source) => source.dir)])];
+    watchedCodexHomes = JSON.stringify(watchOptions.codexHomes);
+    const directoryKey = JSON.stringify([dirs, activitySources, watchOptions.senpiSources, watchedCodexHomes]);
+    if (directoryKey === watchedDirectoryKey) return;
+    // Initial adds are suppressed, so remember an existing exporter name
+    // before the first event arrives. It may be an unlink.
+    copilotExporter?.rememberExistingAlias();
+    closeWatchers();
+    if (dirs.length === 0) {
+      watchedDirectoryKey = directoryKey;
+      activityWatchReady = true; // no existing sources; slow discovery is enough
+      lastWatchFailureCode = null;
+      log('No watchable client data directories found; relying on fallback interval only.');
+      return;
+    }
+    function handleWatchEvent(event, filePath, unlinkedExporter) {
+      // The quit path leaves the watcher open (see stop), so events can still
+      // arrive after the collector is done with them.
+      if (stopped) return;
+      // Drop the wal-index sidecar of clients whose own scan recreates it, so
+      // the collector cannot re-trigger itself. See
+      // SELF_WATCHED_SQLITE_SIDECAR_CLIENTS for the measured per-client evidence.
+      if (isSelfWatchSqliteSidecarEvent(filePath, rootsByClient)) return;
+      const eventClients = clientsForWatchPath(filePath, attributionRootsByClient, attributionIgnores, copilotExporter, unlinkedExporter);
+      const activityClients = activityClientsForPath(filePath, activitySources);
+      if (activityClients.length || eventClients.some(isSessionActivityClient)) {
+        activityScheduler?.request();
+      }
+      // The read-only T3 reader can recreate -shm itself. Neither it nor other
+      // activity-only writes are token usage, so they cannot request a scan.
+      if (eventClients.length === 0 && activitySources.some((source) => {
+        const relative = path.relative(source.dir, path.resolve(filePath || '.'));
+        return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+      })) return;
+      activityRevision += 1;
+      if (tickPending) {
+        pendingActivityRevision = pendingActivityRevision === null
+          ? activityRevision
+          : Math.max(pendingActivityRevision, activityRevision);
+      }
+      if (
+        reasonixNativeSessionCache
+        && isReasonixNativeSessionSidecar(filePath)
+        && isReasonixNativeSessionPath(
+          filePath,
+          typeof reasonixNativeSessionCache.sessionRoots === 'function'
+            ? reasonixNativeSessionCache.sessionRoots()
+            : reasonixNativeSessionWatchRoots(watchOptions)
+        )
+      ) {
+        reasonixNativeSessionCache.invalidate(filePath);
+      }
+      for (const client of clientsForWatchPath(filePath, sourceSyncRootsByClient, attributionIgnores)) {
+        // Catalog changes refresh labels, not the RPC usage cache.
+        if (client === 'antigravity' && summaryFiles.has(path.resolve(filePath))) continue;
+        // Another client's scan root may overlap the desktop store. Its unrelated
+        // files can request a local scan, but only database/WAL writes earn a
+        // Cursor cloud sync.
+        if (client === 'cursor' && (!isCursorDesktopStateWrite(filePath)
+          || !sourceSyncRootsByClient.cursor.some((root) => path.dirname(path.resolve(filePath)) === path.resolve(root)))) continue;
+        sourceSyncQueue.record(client);
+      }
+      if (watchTriggersCollection) {
+        scheduleTick(
+          `watch:${event}:${path.basename(filePath || '')}`,
+          eventClients
+        );
+      } else recordWatchClients(eventClients);
+    }
+
+    const usePolling = watchUsePolling || watchDescriptorFallback;
+    try {
+      const host = createWatcherHost(
+        {
+          dirs,
+          usageDirs,
+          activitySources,
+          clients,
+          customScanPaths: sourceOptions.customScanPaths,
+          cursorDesktopRoots: sourceSyncRootsByClient.cursor || [],
+          homeDir: sourceOptions.homeDir,
+          env: sourceOptions.env,
+          cwdDir: sourceOptions.cwdDir,
+          codexHomes: watchOptions.codexHomes,
+          senpiSources: watchOptions.senpiSources,
+          usePolling,
+          pollingEntryLimit: watchPollingEntryLimit
+        },
+        {
+          onHostFallback: (error, fallback = {}) => {
+            activityWatchReady = false;
+            activityScheduler?.request();
+            // The host moves to polling by itself when a watch process never
+            // confirmed its exit; diagnostics have to say so.
+            if (fallback.usePolling === true) watchHostPolling = true;
+            emitDiagnosticEvent({ subsystem: 'watcher', code: 'watcher-host-fallback' });
+            log(`Watch worker unavailable (${error.message}); watching on this thread.`);
+          },
+          onError: handleWatchError,
+          onReady: () => { activityWatchReady = !usePolling && !watchHostPolling; },
+          onEvent: handleWatchEvent
+        }
+      );
+      watchers.push(host);
+      watchedDirectoryKey = directoryKey;
+      lastWatchFailureCode = null;
+      for (const dir of dirs) log(`Watching ${dir} (${usePolling ? 'polling 2s' : 'native events'})`);
+    } catch (error) {
+      watchedDirectoryKey = null;
+      lastWatchFailureCode = 'watcher-rebuild-failed';
+      emitDiagnosticEvent({ subsystem: 'watcher', code: 'watcher-rebuild-failed' });
+      log(`Cannot watch ${dirs.join(', ')}: ${error.message}`);
+    }
+  }
+
+  function loop() {
+    if (stopped) return;
+    const activityRevisionAtStart = activityRevision;
+    // Native watchers are an optimization, not the source of truth. Always
+    // retain the hourly reconciliation path for missed events, newly created
+    // client directories, WSL-only activity, and cross-day metadata refreshes.
+    const calendarChanged = Boolean(anchor && anchor.calendarKey !== collectionCalendarKey(collectionDate(options.now)));
+    const fullScanDue = calendarChanged || lastFullScanAt === 0 || Date.now() - lastFullScanAt >= FULL_SCAN_INTERVAL_MS;
+    // Smart mode trusts the watcher to say which clients moved. Without one it
+    // is plain interval collection, or it would scan nothing but the hourly
+    // reconciliation.
+    const activityGated = intervalRequiresActivity && !watchIntervalFallback;
+    if (
+      activityGated &&
+      initialCollectionComplete &&
+      !fullScanDue &&
+      activityRevisionAtStart <= collectedActivityRevision
+    ) {
+      intervalTimer = setTimeout(loop, intervalMs);
+      return;
+    }
+    // Full scan at least once per FULL_SCAN_INTERVAL_MS so the anchor
+    // does not drift from reality over a long-running session.
+    // lastFullScanAt === 0 means no valid timestamp exists (cold start,
+    // unparseable, or future timestamp) — force a full scan immediately.
+    const anchorToday = Boolean(!fullScanDue && anchor && anchor.dateKey === localTodayKey());
+    const sourceSelfSync = activityGated ? sourceSyncQueue.takeDue() : null;
+    // Smart mode carries the clients its watch events named since the last tick
+    // and unions the self-synced ones on top regardless. Their tokscale cache
+    // dirs are deliberately unwatched to avoid a self-triggering loop, so a sync
+    // can refresh what tokscale reads without any event naming the client it
+    // belongs to. Native Cursor and Antigravity source roots are watched and do
+    // name the client, but that tracks the IDE writing rather than the sync
+    // landing, so targeting alone would still miss the sync output.
+    const targetClients = activityGated ? takeWatchClients(selfSyncedClients) : [];
+    runTick('interval', {
+      ...(anchorToday ? { todayOnly: true, refreshWsl: true, targetClients } : {}),
+      ...(sourceSelfSync ? { sourceSelfSync } : {}),
+      activityRevision: activityRevisionAtStart
+    }).finally(() => {
+      if (stopped) return;
+      intervalTimer = setTimeout(loop, intervalMs);
+    });
+  }
+
+  function pollSessionActivity() {
+    const providers = sessionActivityProvidersFor(trackedClients);
+    if (stopped || !providers.length) return true;
+    activityUpdate = (async () => {
+      if (tickInFlight || !latestActivitySummary) return false;
+      // Published snapshots are immutable. Replace only the affected maps;
+      // counters, history and the exact scan anchor stay untouched.
+      const previous = latestActivitySummary;
+      const activityOptions = activityReadOptions(options, { ...sourceOptions, homeDir: options.homeDir || os.homedir() }, providers);
+      const next = await refreshSessionActivity(previous, providers, options, activityOptions, {
+        isCurrent: () => !stopped && !tickInFlight && latestActivitySummary === previous
+      });
+      if (!next) return false;
+      if (next === previous) return;
+      // Hosts that understand activity patches bypass accounting transforms,
+      // archive writes and whole-summary IPC. Legacy callers retain onUpdate.
+      if (typeof options.onSessionActivity === 'function') {
+        const { activityPatch } = require('./sessionActivityProjection');
+        await options.onSessionActivity(activityPatch(previous, next));
+      } else await onUpdate?.(require('./sessionActivityProjection').materializeActivity(next), 'session-activity');
+      if (!stopped && latestActivitySummary === previous) latestActivitySummary = next;
+    })().catch((error) => {
+      if (!stopped) log(`Session activity update failed: ${error.message}`);
+      return false;
+    }).finally(() => {
+      activityUpdate = null;
+    });
+    return activityUpdate;
+  }
+
+  // Stays synchronous and never returns a promise: startMode() and friends rely
+  // on stop() having severed the old collector by the time it returns. Setting
+  // `stopped` is what does the severing, so a watcher left alive by
+  // skipCloseWatchers still cannot drive a tick.
+  function stop(options = {}) {
+    if (stopped) return;
+    stopped = true;
+    runtimeAbortController.abort(new Error('collector stopped'));
+    codexLocalSource?.stop();
+    cursorSource?.stop();
+    pricingRefresher?.stop();
+    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+    if (intervalTimer) { clearTimeout(intervalTimer); intervalTimer = null; }
+    activityScheduler?.stop();
+    clearRolloverHistoryRetry();
+    sourceSyncQueue.stop();
+    closeWatchers({ skipClose: options.skipCloseWatchers === true });
+    watchedDirectoryKey = null;
+  }
+
+  function whenIdle() {
+    // startCollector() calls loop() synchronously before returning this handle,
+    // so runTick's reaction to this same barrier is always registered first.
+    // It clears startBarrier before this continuation asks again; the regression
+    // test pins that startup ordering because reversing it would microtask-spin.
+    if (startBarrier) return Promise.resolve(startBarrier).then(() => whenIdle());
+    // Same ordering as the barrier: the waiting tick resumes, and enters
+    // tickInFlight, before this continuation asks again.
+    if (cursorRestartRead) return cursorRestartRead.then(() => whenIdle());
+    const usageIdle = !tickInFlight ? Promise.resolve() : new Promise((resolve) => idleWaiters.push(resolve));
+    return usageIdle.then(() => activityUpdate).then(() => stopped
+      ? Promise.all([pricingRefresher?.whenIdle(), codexLocalSource?.whenIdle(), cursorSource?.whenIdle()]) : undefined);
+  }
+
+  function getDiagnostics() {
+    const watchMode = !watchEnabled
+      ? 'disabled'
+      : watchIntervalFallback
+        ? 'interval'
+        : (watchUsePolling || watchDescriptorFallback || watchHostPolling ? 'polling' : 'native');
+    const state = stopped
+      ? 'stopped'
+      : tickInFlight
+        ? 'running'
+        : lastTickFailureCode
+          ? 'failed'
+          : 'idle';
+    return {
+      state,
+      collectionMode: watchTriggersCollection ? 'live' : intervalRequiresActivity ? 'smart' : 'interval',
+      intervalMs,
+      watchDebounceMs,
+      watchEnabled,
+      watchMode,
+      watchFallbackCode,
+      lastWatchFailureCode,
+      tickInFlight,
+      tickPending,
+      lastTickReasonCode,
+      lastTickScope,
+      lastTickAttemptAt: timestampOrNull(lastTickAttemptAt),
+      lastTickSuccessAt: timestampOrNull(lastTickSuccessAt),
+      lastTickFailureAt: timestampOrNull(lastTickFailureAt),
+      lastTickDurationMs,
+      lastFullScanAt: timestampOrNull(lastFullScanAt),
+      lastHistoryAttemptAt: timestampOrNull(lastHistoryAttemptAt),
+      lastHistorySuccessAt: timestampOrNull(lastHistorySuccessAt),
+      lastHistoryFailureCode,
+      lastHistoryScanDurationMs,
+      lastFailureCode: lastTickFailureCode,
+      ...(codexLocalSource ? { codexLocalUsage: codexLocalSource.getDiagnostics() } : {}),
+      wslStatus: cloneDiagnosticValue(wslStatusAnchor)
+    };
+  }
+
+  setupWatchers();
+  loop();
+  // Injected scans own their pricing in tests/embedders. Production downloads
+  // run independently of usage ticks, never once per model or source event.
+  if (!options.runTokscale || options.refreshPricingCatalog) {
+    pricingRefresher = createPricingCatalogRefresher({
+      env: tokscaleEnvWithBlanksDropped(process.env),
+      refresh: options.refreshPricingCatalog || (() => spawnTokscaleJson(
+        ['pricing', 'refresh', '--json', '--no-spinner'], 120_000,
+        tokscaleCommand(), runtimeSignal, {
+          operation: 'tokscale pricing refresh',
+          terminationOptions: options.subprocessTerminationOptions
+        }
+      )),
+      onUpdate: () => runTick('pricing-change', { forceHistory: true }),
+      onError: error => log(`Pricing refresh failed; retaining cached prices: ${error.message}`)
+    }, options.pricingCatalogTimers);
+    pricingRefresher.start();
+  }
+  if (options.sessionActivityPolling !== false && sessionActivityProvidersFor(trackedClients).length) {
+    activityScheduler = createSessionActivityScheduler({
+      refresh: pollSessionActivity,
+      nativeEventsReady: () => activityWatchReady || !watchEnabled,
+      needsRenewal: () => require('./sessionActivityProjection').needsActivityRenewal(latestActivitySummary)
+    }, options.sessionActivityTimers);
+    activityScheduler.start();
+  }
+  if (trackedClients.has('codex') && options.codexLocalUsageEnabled !== false
+    && (options.codexDotsEnabled === true || (options.codexDotsEnabled === undefined
+      && (options.env || process.env).TOKEN_MONITOR_CODEX_LOCAL_USAGE === '1'))) {
+    codexLocalSource = createLocalUsageSource({
+      ...sourceOptions,
+      agentRuntime: options.agentRuntime,
+      store: options.codexLocalUsageStore,
+      onChange() {
+        if (stopped) return;
+        activityRevision += 1;
+        if (watchTriggersCollection) scheduleTick('watch:codex-local-usage', ['codex']);
+        else recordWatchClients(['codex']);
+      }
+    });
+    codexLocalSource.start();
+  }
+
+  // A rescan of one tool. Was cursor-only because a Cursor sign-in was the only
+  // caller; the machinery underneath was always per-client, so the guard was a
+  // narrower contract than the implementation. `targetClients` keeps the scan to
+  // the partition being asked about instead of every client's today.
+  function refreshClient(clientId, refreshOptions = {}) {
+    const normalized = String(clientId || '').trim().toLowerCase();
+    if (!normalized || !trackedClients.has(normalized)) {
+      throw new TypeError(`Unsupported targeted usage client: ${normalized || '(empty)'}`);
+    }
+    if (normalized === 'cursor' && cursorSource && refreshOptions.forceSync !== true) {
+      return cursorSource.readCache({ day: localTodayKey(collectionDate(options.now)), pricing: pricingFingerprint(options), calendar: collectionCalendarKey(collectionDate(options.now)) })
+        .then(() => runTick('client:cursor', { forceHistory: true, cursorSnapshotRefresh: true }))
+        .catch(error => {
+          if (!stopped) {
+            if (onError) onError(error, 'client:cursor'); else log(`Cursor cache refresh failed: ${error.message}`);
+          }
+          return false;
+        });
+    }
+    return runTick(`client:${normalized}`, {
+      todayOnly: true,
+      targetClients: [normalized],
+      // Only the self-synced clients have a sync to force; naming any other here
+      // would be read by nothing.
+      forceSelfSync: refreshOptions.forceSync === true && SELF_SYNCED_CLIENTS.has(normalized) ? [normalized] : null
+    });
+  }
+
+  return {
+    getDiagnostics,
+    refreshClient,
+    setCodexDotsVisible(visible) {
+      if (stopped) return Promise.resolve(false);
+      const next = visible !== false;
+      if (next === codexDotsVisible) return Promise.resolve(true);
+      codexDotsVisible = next;
+      codexVisibilityRevision += 1;
+      codexLocalView = null;
+      return runTick('dots-visibility', { todayOnly: true, targetClients: ['codex'], forceHistory: true });
+    },
+    stop,
+    tick: (reason = 'manual', tickOptions = {}) => runTick(reason, tickOptions),
+    whenIdle
+  };
+}
+
+module.exports = {
+  applySessionTimestamps: applySessionMetadata,
+  projectIdentity,
+  projectPathFromJsonl,
+  archivedHistory,
+  collectHistoryOnce,
+  collectUsageOnce,
+  clientActivityDaysFromHistory,
+  clientDataDirPresence,
+  clientDiagnosticRoots,
+  visibleDiagnosticRoots,
+  clientSourceChecks,
+  clientSourceRoots,
+  cherryStudioTranscriptRoots,
+  clientsForWatchPath,
+  clientWatchCandidates,
+  computePeriodWindows,
+  collectionCalendarKey,
+  collectorAnchorTrust,
+  pricingFingerprint,
+  configFingerprint,
+  deriveClientHealth,
+  deriveClientStatus,
+  mergeClientActivityDays,
+  wslPeriodsForPreview,
+  statusFromSignals,
+  DEFAULT_HISTORY_INTERVAL_MS,
+  HISTORY_INTERVAL_VALUES,
+  LIMITS_RESET_BOUNDARY_MAX_TIMER_MS,
+  localTodayKey,
+  nextLimitsResetBoundary,
+  normalizeHistoryIntervalMs,
+  sessionTimestampMap: sessionMetadataMap,
+  locateBundledBinary,
+  lookupModelPricing,
+  pruneAttemptedResetBoundaries,
+  getTokscaleStatus,
+  readTokscaleBundledBuild,
+  resolvePlatformBinary,
+  resetTokscaleCapabilityCache,
+  kimiWorkSessionsRoots,
+  resolveWatchUsePolling,
+  selfSyncSourceRootsForClients,
+  // The process-wide sync throttle this module drives. Exported so a test can
+  // read or pin a client's floor directly instead of inferring it from tick
+  // timings; the collector never takes a second instance.
+  selfSyncThrottle,
+  isSelfWatchSqliteSidecarEvent,
+  shouldIncludeHistory,
+  spawnTokscaleHelp,
+  startCollector,
+  tokscaleCommand,
+  tokscaleClientFilter,
+  tokscaleEnvWithBlanksDropped,
+  TOKSCALE_CLIENT_ALIASES,
+  watchAttributionRootsForClients,
+  watcherOptions,
+  watchIgnoreMatcher,
+  openWatch,
+  WATCH_POLLING_LIMIT_CODE,
+  WATCH_POLLING_UNAVAILABLE_CODE,
+  WATCH_REFUSAL_CODES,
+  watchPathsForClients
+};
